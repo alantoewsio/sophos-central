@@ -1,0 +1,7 @@
+{
+    "editor.minimap.maxColumn": 120,
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.rulers": [
+        88, 100, 120
+    ]
+}
