@@ -49,17 +49,37 @@ def _get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
     return obj
 
 
-def get_run_summary(conn: sqlite3.Connection, update_id: str) -> dict[str, dict[str, int]]:
-    """Return per-table counts of records added and updated in the run with the given update_id."""
+def get_new_alert_ids(
+    conn: sqlite3.Connection, sync_id: str, tenant_id: str
+) -> list[str]:
+    """Return alert IDs that were added (first_sync = last_sync) in this run for the given tenant."""
+    cur = conn.execute(
+        "SELECT id FROM alerts WHERE sync_id = ? AND first_sync = last_sync AND tenant_id = ?",
+        (sync_id, tenant_id),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
+def get_run_summary(conn: sqlite3.Connection, sync_id: str) -> dict[str, dict[str, int]]:
+    """Return per-table counts of records added and updated in the run with the given sync_id."""
     summary: dict[str, dict[str, int]] = {}
-    for table in ("tenants", "firewalls", "licenses", "license_subscriptions"):
+    for table in (
+        "tenants",
+        "firewalls",
+        "licenses",
+        "license_subscriptions",
+        "alerts",
+        "alert_details",
+        "firmware_upgrades",
+        "firmware_versions",
+    ):
         added_cur = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE update_id = ? AND added_timestamp = updated_timestamp",
-            (update_id,),
+            f"SELECT COUNT(*) FROM {table} WHERE sync_id = ? AND first_sync = last_sync",
+            (sync_id,),
         )
         updated_cur = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE update_id = ? AND (added_timestamp IS NULL OR added_timestamp != updated_timestamp)",
-            (update_id,),
+            f"SELECT COUNT(*) FROM {table} WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+            (sync_id,),
         )
         summary[table] = {
             "added": added_cur.fetchone()[0],
@@ -73,6 +93,20 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_latest_alert_raised_at(
+    conn: sqlite3.Connection, tenant_id: str
+) -> Optional[str]:
+    """Return the latest raised_at (ISO 8601) for alerts for the given tenant, or None."""
+    cur = conn.execute(
+        "SELECT MAX(raised_at) FROM alerts WHERE tenant_id = ?",
+        (tenant_id,),
+    )
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return str(row[0])
+    return None
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -92,9 +126,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             external_ids_json TEXT,
             products_json TEXT,
             updated_at TEXT NOT NULL,
-            added_timestamp TEXT,
-            updated_timestamp TEXT,
-            update_id TEXT
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT
         );
 
         CREATE TABLE IF NOT EXISTS firewalls (
@@ -118,10 +152,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             geo_longitude TEXT,
             created_at TEXT,
             updated_at TEXT,
-            synced_at TEXT NOT NULL,
-            added_timestamp TEXT,
-            updated_timestamp TEXT,
-            update_id TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
             FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         );
         CREATE INDEX IF NOT EXISTS ix_firewalls_tenant_id ON firewalls(tenant_id);
@@ -135,10 +168,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             model TEXT,
             model_type TEXT,
             last_seen_at TEXT,
-            synced_at TEXT NOT NULL,
-            added_timestamp TEXT,
-            updated_timestamp TEXT,
-            update_id TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
             FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         );
         CREATE INDEX IF NOT EXISTS ix_licenses_tenant_id ON licenses(tenant_id);
@@ -157,24 +189,141 @@ def init_schema(conn: sqlite3.Connection) -> None:
             usage_count INTEGER,
             usage_date TEXT,
             unlimited INTEGER NOT NULL DEFAULT 0,
-            synced_at TEXT NOT NULL,
-            added_timestamp TEXT,
-            updated_timestamp TEXT,
-            update_id TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
             PRIMARY KEY (id),
             FOREIGN KEY (serial_number) REFERENCES licenses(serial_number)
         );
         CREATE INDEX IF NOT EXISTS ix_license_subscriptions_serial ON license_subscriptions(serial_number);
+
+        CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            category TEXT,
+            description TEXT,
+            group_key TEXT,
+            product TEXT,
+            raised_at TEXT,
+            severity TEXT,
+            type TEXT,
+            allowed_actions_json TEXT,
+            managed_agent_json TEXT,
+            person_json TEXT,
+            tenant_ref_json TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_alerts_tenant_id ON alerts(tenant_id);
+        CREATE INDEX IF NOT EXISTS ix_alerts_raised_at ON alerts(raised_at);
+
+        CREATE TABLE IF NOT EXISTS alert_details (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            category TEXT,
+            description TEXT,
+            group_key TEXT,
+            product TEXT,
+            raised_at TEXT,
+            severity TEXT,
+            type TEXT,
+            allowed_actions_json TEXT,
+            managed_agent_json TEXT,
+            person_json TEXT,
+            tenant_ref_json TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            FOREIGN KEY (id) REFERENCES alerts(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_alert_details_tenant_id ON alert_details(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS firmware_upgrades (
+            firewall_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            serial_number TEXT NOT NULL,
+            current_version TEXT,
+            upgrade_to_versions_json TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            FOREIGN KEY (firewall_id) REFERENCES firewalls(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_firmware_upgrades_tenant_id ON firmware_upgrades(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS firmware_versions (
+            version TEXT PRIMARY KEY,
+            size TEXT,
+            bugs_json TEXT,
+            news_json TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT
+        );
     """)
+    _migrate_sync_columns(conn)
     _ensure_sync_columns(conn)
+    _drop_synced_at_column(conn)
     conn.commit()
     logger.debug("Schema initialized")
 
 
+def _migrate_sync_columns(conn: sqlite3.Connection) -> None:
+    """Rename old sync column names to first_sync, last_sync, sync_id if present."""
+    renames = (
+        ("added_timestamp", "first_sync"),
+        ("updated_timestamp", "last_sync"),
+        ("update_id", "sync_id"),
+    )
+    for table in (
+        "tenants",
+        "firewalls",
+        "licenses",
+        "license_subscriptions",
+        "alerts",
+        "alert_details",
+        "firmware_upgrades",
+        "firmware_versions",
+    ):
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cur.fetchall()}
+        for old_name, new_name in renames:
+            if old_name in existing and new_name not in existing:
+                conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}")
+                logger.debug("Renamed %s.%s to %s", table, old_name, new_name)
+
+
+def _drop_synced_at_column(conn: sqlite3.Connection) -> None:
+    """Drop synced_at column from tables that have it (SQLite 3.35+)."""
+    for table in (
+        "firewalls",
+        "licenses",
+        "license_subscriptions",
+        "alerts",
+        "alert_details",
+        "firmware_upgrades",
+        "firmware_versions",
+    ):
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        if any(row[1] == "synced_at" for row in cur.fetchall()):
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN synced_at")
+            logger.debug("Dropped column synced_at from %s", table)
+
+
 def _ensure_sync_columns(conn: sqlite3.Connection) -> None:
-    """Add added_timestamp, updated_timestamp, update_id to existing tables if missing."""
-    columns = ("added_timestamp TEXT", "updated_timestamp TEXT", "update_id TEXT")
-    for table in ("tenants", "firewalls", "licenses", "license_subscriptions"):
+    """Add first_sync, last_sync, sync_id to existing tables if missing."""
+    columns = ("first_sync TEXT", "last_sync TEXT", "sync_id TEXT")
+    for table in (
+        "tenants",
+        "firewalls",
+        "licenses",
+        "license_subscriptions",
+        "alerts",
+        "alert_details",
+        "firmware_upgrades",
+        "firmware_versions",
+    ):
         cur = conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
         for col_spec in columns:
@@ -236,7 +385,7 @@ def upsert_tenant(
             id, show_as, name, data_geography, data_region, billing_type,
             partner_id, organization_id, api_host, status, contact_json,
             external_ids_json, products_json, updated_at,
-            added_timestamp, updated_timestamp, update_id
+            first_sync, last_sync, sync_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             show_as = excluded.show_as,
@@ -252,8 +401,8 @@ def upsert_tenant(
             external_ids_json = excluded.external_ids_json,
             products_json = excluded.products_json,
             updated_at = excluded.updated_at,
-            updated_timestamp = excluded.updated_timestamp,
-            update_id = excluded.update_id
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
         """,
         row,
     )
@@ -295,7 +444,6 @@ def upsert_firewall(
         getattr(geo, "longitude", None) if geo else None,
         getattr(firewall, "createdAt", None),
         getattr(firewall, "updatedAt", None),
-        _now_utc(),
         run_timestamp,
         run_timestamp,
         update_id,
@@ -307,9 +455,9 @@ def upsert_firewall(
             external_ipv4_addresses_json, firmware_version, model,
             managing_status, reporting_status, connected, suspended,
             state_changed_at, capabilities_json, geo_latitude, geo_longitude,
-            created_at, updated_at, synced_at,
-            added_timestamp, updated_timestamp, update_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, updated_at,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             tenant_id = excluded.tenant_id,
             serial_number = excluded.serial_number,
@@ -330,9 +478,8 @@ def upsert_firewall(
             geo_longitude = excluded.geo_longitude,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
-            synced_at = excluded.synced_at,
-            updated_timestamp = excluded.updated_timestamp,
-            update_id = excluded.update_id
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
         """,
         row,
     )
@@ -357,9 +504,9 @@ def upsert_license(
         """
         INSERT INTO licenses (
             serial_number, tenant_id, partner_id, organization_id,
-            model, model_type, last_seen_at, synced_at,
-            added_timestamp, updated_timestamp, update_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            model, model_type, last_seen_at,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(serial_number) DO UPDATE SET
             tenant_id = excluded.tenant_id,
             partner_id = excluded.partner_id,
@@ -367,9 +514,8 @@ def upsert_license(
             model = excluded.model,
             model_type = excluded.model_type,
             last_seen_at = excluded.last_seen_at,
-            synced_at = excluded.synced_at,
-            updated_timestamp = excluded.updated_timestamp,
-            update_id = excluded.update_id
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
         """,
         (
             serial,
@@ -379,7 +525,6 @@ def upsert_license(
             license_obj.model,
             getattr(license_obj, "modelType", None),
             getattr(license_obj, "lastSeenAt", None),
-            _now_utc(),
             run_timestamp,
             run_timestamp,
             update_id,
@@ -403,9 +548,9 @@ def upsert_license(
             INSERT INTO license_subscriptions (
                 id, serial_number, license_identifier, product_code, product_name,
                 start_date, end_date, perpetual, type, quantity,
-                usage_count, usage_date, unlimited, synced_at,
-                added_timestamp, updated_timestamp, update_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                usage_count, usage_date, unlimited,
+                first_sync, last_sync, sync_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 serial_number = excluded.serial_number,
                 license_identifier = excluded.license_identifier,
@@ -419,9 +564,8 @@ def upsert_license(
                 usage_count = excluded.usage_count,
                 usage_date = excluded.usage_date,
                 unlimited = excluded.unlimited,
-                synced_at = excluded.synced_at,
-                updated_timestamp = excluded.updated_timestamp,
-                update_id = excluded.update_id
+                last_sync = excluded.last_sync,
+                sync_id = excluded.sync_id
             """,
             (
                 sub.id,
@@ -437,9 +581,205 @@ def upsert_license(
                 usage_count,
                 usage_date,
                 1 if getattr(sub, "unlimited", False) else 0,
-                _now_utc(),
                 run_timestamp,
                 run_timestamp,
                 update_id,
             ),
         )
+
+
+def upsert_alert(
+    conn: sqlite3.Connection,
+    alert: Any,
+    *,
+    tenant_id: Optional[str] = None,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Insert or replace an alert. Accepts central.alerts.classes.Alert or dict-like."""
+    aid = _get(alert, "id") or "unknown"
+    tenant_ref = _get(alert, "tenant")
+    tid = tenant_id or (_get_nested(tenant_ref, "id") if tenant_ref else None)
+    managed_json = _to_json(_get(alert, "managedAgent"))
+    person_json = _to_json(_get(alert, "person"))
+    tenant_ref_json = _to_json(tenant_ref)
+
+    row = (
+        aid,
+        tid,
+        _get(alert, "category"),
+        _get(alert, "description"),
+        _get(alert, "groupKey"),
+        _get(alert, "product"),
+        _get(alert, "raisedAt"),
+        _get(alert, "severity"),
+        _get(alert, "type"),
+        _to_json(_get(alert, "allowedActions")),
+        managed_json,
+        person_json,
+        tenant_ref_json,
+        run_timestamp,
+        run_timestamp,
+        update_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO alerts (
+            id, tenant_id, category, description, group_key, product,
+            raised_at, severity, type, allowed_actions_json,
+            managed_agent_json, person_json, tenant_ref_json,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            category = excluded.category,
+            description = excluded.description,
+            group_key = excluded.group_key,
+            product = excluded.product,
+            raised_at = excluded.raised_at,
+            severity = excluded.severity,
+            type = excluded.type,
+            allowed_actions_json = excluded.allowed_actions_json,
+            managed_agent_json = excluded.managed_agent_json,
+            person_json = excluded.person_json,
+            tenant_ref_json = excluded.tenant_ref_json,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
+        """,
+        row,
+    )
+
+
+def upsert_alert_detail(
+    conn: sqlite3.Connection,
+    alert: Any,
+    *,
+    tenant_id: Optional[str] = None,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Insert or replace a row in alert_details (full alert from get_alert). Same shape as alerts."""
+    aid = _get(alert, "id") or "unknown"
+    tenant_ref = _get(alert, "tenant")
+    tid = tenant_id or (_get_nested(tenant_ref, "id") if tenant_ref else None)
+    managed_json = _to_json(_get(alert, "managedAgent"))
+    person_json = _to_json(_get(alert, "person"))
+    tenant_ref_json = _to_json(tenant_ref)
+
+    row = (
+        aid,
+        tid,
+        _get(alert, "category"),
+        _get(alert, "description"),
+        _get(alert, "groupKey"),
+        _get(alert, "product"),
+        _get(alert, "raisedAt"),
+        _get(alert, "severity"),
+        _get(alert, "type"),
+        _to_json(_get(alert, "allowedActions")),
+        managed_json,
+        person_json,
+        tenant_ref_json,
+        run_timestamp,
+        run_timestamp,
+        update_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO alert_details (
+            id, tenant_id, category, description, group_key, product,
+            raised_at, severity, type, allowed_actions_json,
+            managed_agent_json, person_json, tenant_ref_json,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            category = excluded.category,
+            description = excluded.description,
+            group_key = excluded.group_key,
+            product = excluded.product,
+            raised_at = excluded.raised_at,
+            severity = excluded.severity,
+            type = excluded.type,
+            allowed_actions_json = excluded.allowed_actions_json,
+            managed_agent_json = excluded.managed_agent_json,
+            person_json = excluded.person_json,
+            tenant_ref_json = excluded.tenant_ref_json,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
+        """,
+        row,
+    )
+
+
+def upsert_firmware_upgrade(
+    conn: sqlite3.Connection,
+    upgrade: Any,
+    *,
+    tenant_id: str,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Insert or replace a firewall firmware upgrade row. Accepts FirewallUpgrade."""
+    upgrade_to = getattr(upgrade, "upgradeToVersion", None) or []
+    row = (
+        upgrade.id,
+        tenant_id,
+        upgrade.serialNumber,
+        getattr(upgrade, "firmwareVersion", None),
+        _to_json(upgrade_to),
+        run_timestamp,
+        run_timestamp,
+        update_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO firmware_upgrades (
+            firewall_id, tenant_id, serial_number, current_version,
+            upgrade_to_versions_json,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(firewall_id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            serial_number = excluded.serial_number,
+            current_version = excluded.current_version,
+            upgrade_to_versions_json = excluded.upgrade_to_versions_json,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
+        """,
+        row,
+    )
+
+
+def upsert_firmware_version(
+    conn: sqlite3.Connection,
+    fw_version: Any,
+    *,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Insert or replace a firmware version (release notes). Accepts FirmwareVersion."""
+    row = (
+        fw_version.version,
+        getattr(fw_version, "size", None),
+        _to_json(getattr(fw_version, "bugs", None)),
+        _to_json(getattr(fw_version, "news", None)),
+        run_timestamp,
+        run_timestamp,
+        update_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO firmware_versions (
+            version, size, bugs_json, news_json,
+            first_sync, last_sync, sync_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(version) DO UPDATE SET
+            size = excluded.size,
+            bugs_json = excluded.bugs_json,
+            news_json = excluded.news_json,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id
+        """,
+        row,
+    )

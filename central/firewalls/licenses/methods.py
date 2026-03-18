@@ -13,13 +13,17 @@ def get_licenses(
     tenant_id: str = None,
     partner_id: str = None,
     sort: str = None,
+    url_base: str = None,
 ) -> Licenses | ReturnState:
-    url_base = "https://api.central.sophos.com"
     params = {}
     if sort is not None:
         params["sort"] = sort
     logger.debug(
-        "get_licenses tenant_id=%s partner_id=%s sort=%s", tenant_id, partner_id, sort
+        "get_licenses tenant_id=%s partner_id=%s sort=%s url_base=%s",
+        tenant_id,
+        partner_id,
+        sort,
+        url_base,
     )
     response = central.get(
         "/licenses/v1/licenses/firewalls",

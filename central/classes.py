@@ -113,8 +113,16 @@ class CentralResponse:
         try:
             self.data = response.json()
             if "pages" in self.data:
-                logger.trace("Response pages: %s", self.data["pages"])
-                self.pages = PaginationResponse(**self.data["pages"])
+                logger.debug("Response pages: %s", self.data["pages"])
+                p = self.data["pages"]
+                # Common API uses key-based pagination (nextKey, fromKey)
+                if "nextKey" in p or "fromKey" in p:
+                    self.pages = types.SimpleNamespace(**p)
+                # Offset-based pagination (current, size, maxSize)
+                elif "current" in p and "size" in p and "maxSize" in p:
+                    self.pages = PaginationResponse(**p)
+                else:
+                    self.pages = types.SimpleNamespace(**p)
             if "items" in self.data:
                 self.items = self.data["items"]
         except ValueError:

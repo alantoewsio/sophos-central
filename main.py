@@ -1,9 +1,12 @@
 from __future__ import annotations
 import argparse
+from datetime import datetime
 import logging
 import os
 from typing import List
 from dotenv import dotenv_values
+
+from central.firewalls.firmware.classes import FirmwareUpgrade
 from central.logging_config import configure_logging
 from central.firewalls.licenses.classes import License
 from central.session import CentralSession
@@ -12,11 +15,13 @@ from central.firewalls.groups.methods import get_firewall_groups
 from central.firewalls.classes import Firewall
 from central.firewalls.groups.classes import Group
 from central.firewalls.licenses import get_licenses
+from central.firewalls.firmware.methods import firmware_upgrade_check
+
 
 # Default log level when not overridden by CLI or LOG_LEVEL env
 DEFAULT_LOG_LEVEL = "INFO"
 
-LOG_LEVEL_CHOICES = ("TRACE", "DEBUG", "INFO", "WARNING", "ERROR")
+LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +187,22 @@ def main():
                 print(f"    Licenses: {len(licenses)}")
             else:
                 print(f"    Licenses: {licenses.message}")
+
+            fw_ids = [fw.id for fw in firewalls]
+            firmware_upgrades = firmware_upgrade_check(
+                central, fw_ids, tenant_id=tenant.id, url_base=tenant.apiHost
+            )
+            if firmware_upgrades.success:
+                upgrades = firmware_upgrades.list_available_upgrades()
+                print(f"    Firmware upgrades: {len(upgrades)}")
+                for fw in upgrades:
+                    print(
+                        f"    {fw.serialNumber} {fw.firmwareVersion} {fw.upgradeToVersion}"
+                    )
+
+            else:
+                print(f"    Firmware upgrades: {firmware_upgrades.message}")
+
     else:
         firewalls = get_firewalls(central)
         print_firewall_summary(firewalls)
@@ -193,6 +214,30 @@ def main():
         result = get_licenses(central)
         print_license_summary(result)
 
+        fw_ids = [fw.id for fw in firewalls]
+        firmware_upgrades = firmware_upgrade_check(
+            central, fw_ids, tenant_id=tenant.id, url_base=tenant.apiHost
+        )
+        if firmware_upgrades.success:
+            print(
+                f"    Firmware upgrades: {len(firmware_upgrades.list_available_upgrades())}"
+            )
+            for fw in firmware_upgrades.firewalls:
+                print(
+                    f"    {fw.serialNumber} {fw.firmwareVersion} {fw.upgradeToVersion}"
+                )
+
+        else:
+            print(f"    Firmware upgrades: {firmware_upgrades.message}")
+
+
+def test():
+    upgrade = FirmwareUpgrade(
+        id="123", upgradeToVersion="23.0.0.1234", upgradeAt=datetime.now()
+    )
+    print(upgrade.__dict__())
+
 
 if __name__ == "__main__":
+    # test()
     main()

@@ -50,7 +50,7 @@ class CentralSession:
             )
 
         auth_data = response.json()
-        logger.trace("Auth response keys: %s", list(auth_data.keys()))
+        logger.debug("Auth response keys: %s", list(auth_data.keys()))
         self.auth = AuthenticationResponse(**auth_data)
         self.jwt = self.auth.access_token
         logger.info("Auth success; token valid=%s", self.auth.is_valid())
@@ -76,7 +76,7 @@ class CentralSession:
             )
 
         whoami_data = response.json()
-        logger.trace(
+        logger.debug(
             "Whoami response: idType=%s id=%s",
             whoami_data.get("idType"),
             whoami_data.get("id"),
@@ -133,11 +133,12 @@ class CentralSession:
         else:
             full_url = url_base or self.whoami.global_url()
         if params:
-            full_url_path = f"{url_path}?{urlencode(params)}"
+            # doseq=True so list values become repeated keys (e.g. product=firewall&product=other)
+            full_url_path = f"{url_path}?{urlencode(params, doseq=True)}"
         else:
             full_url_path = url_path
         result = urljoin(full_url, full_url_path)
-        logger.trace("Built URL: %s (path=%s, base=%s)", result, url_path, url_base)
+        logger.debug("Built URL: %s (path=%s, base=%s)", result, url_path, url_base)
         return result
 
     def _add_base_headers(
@@ -160,7 +161,7 @@ class CentralSession:
         for k, v in added_headers.items():
             headers[k] = v
 
-        logger.trace(
+        logger.debug(
             "Headers jwt-len=%s tenant_id=%s partner_id=%s org_id=%s",
             len(self.jwt) if self.jwt else 0,
             tenant_id,
@@ -199,29 +200,58 @@ class CentralSession:
         if not result.success:
             return result
 
-        items = result.value.items
-        if hasattr(result.value, "pages"):
-            # print(f"pages: {result.value.pages}")
+        items = result.value.items if result.value.items is not None else []
+        if hasattr(result.value, "pages") and result.value.pages:
             pages = result.value.pages
-            page_num = 1
-
-            while result and pages.total and pages.current < pages.total:
-                page_num += 1
-                logger.trace("Fetching page %d of %s", page_num, url_path)
-                result = self.get_page(
-                    url_path=url_path,
-                    params=params,
-                    page=page_num,
-                    tenant_id=tenant_id,
-                    partner_id=partner_id,
-                    organization_id=organization_id,
-                    url_base=url_base,
-                    paginated=paginated,
-                )
-                if not result.success:
-                    return result
-                items.extend(result.value.items)
-                pages = result.value.pages
+            next_key = getattr(pages, "nextKey", None)
+            if next_key is not None:
+                # Key-based pagination (e.g. Common API alerts)
+                while next_key:
+                    logger.debug("Fetching next page of %s (key=%s)", url_path, next_key)
+                    page_params = dict(params or {})
+                    page_params["pageFromKey"] = next_key
+                    result = self.get_page(
+                        url_path,
+                        params=page_params,
+                        tenant_id=tenant_id,
+                        partner_id=partner_id,
+                        organization_id=organization_id,
+                        url_base=url_base,
+                        paginated=False,
+                    )
+                    if not result.success:
+                        return result
+                    if result.value.items:
+                        items.extend(result.value.items)
+                    next_key = (
+                        getattr(result.value.pages, "nextKey", None)
+                        if getattr(result.value, "pages", None)
+                        else None
+                    )
+            else:
+                # Page-number pagination (only when pages has current/total)
+                page_num = 1
+                total = getattr(pages, "total", None)
+                current = getattr(pages, "current", None)
+                while result and total is not None and current is not None and current < total:
+                    page_num += 1
+                    logger.debug("Fetching page %d of %s", page_num, url_path)
+                    result = self.get_page(
+                        url_path=url_path,
+                        params=params,
+                        page=page_num,
+                        tenant_id=tenant_id,
+                        partner_id=partner_id,
+                        organization_id=organization_id,
+                        url_base=url_base,
+                        paginated=paginated,
+                    )
+                    if not result.success:
+                        return result
+                    items.extend(result.value.items)
+                    pages = result.value.pages
+                    current = getattr(pages, "current", None)
+                    total = getattr(pages, "total", None)
         logger.debug("GET %s returned %d items", url_path, len(items) if items else 0)
         return ReturnState(success=True, value=items)
 
@@ -253,7 +283,7 @@ class CentralSession:
             organization_id=organization_id,
         )
 
-        logger.trace(
+        logger.debug(
             "GET request: url=%s page=%s pageSize=%s", full_url, page, pageSize
         )
         # if "X-Tenant-ID" in headers:
@@ -303,12 +333,13 @@ class CentralSession:
     ) -> ReturnState:
         if not self.auth and not self.authenticate():
             return ReturnState(success=False, message="Error: not authenticated")
-        full_url = self._get_url(url_base, url_path, params)
+        full_url = self._get_url(url_base=url_base, url_path=url_path, params=params)
         headers = self._add_base_headers(
             tenant_id=tenant_id,
             partner_id=partner_id,
             organization_id=organization_id,
         )
+
         response = requests.post(full_url, headers=headers, json=payload)
         central_response = CentralResponse(response)
         return ReturnState(success=central_response.success, value=central_response)

@@ -1,23 +1,11 @@
 """
 Centralized logging configuration for the Sophos Central app.
-Provides TRACE, DEBUG, INFO, and ERROR with file output.
+Provides DEBUG, INFO, WARNING, and ERROR with file output.
 """
 from __future__ import annotations
 
 import logging
 import os
-
-# Custom level: TRACE (below DEBUG) for very verbose diagnostics
-TRACE = 5
-logging.addLevelName(TRACE, "TRACE")
-
-
-def _trace(self, message: str, *args, **kwargs) -> None:
-    if self.isEnabledFor(TRACE):
-        self._log(TRACE, message, args, **kwargs)
-
-
-logging.Logger.trace = _trace
 
 # Default log directory (project root / logs)
 _LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
@@ -36,16 +24,13 @@ def configure_logging(
     Call once at application startup (e.g. from main.py).
 
     Args:
-        level: Log level name or int (e.g. 'DEBUG', 'TRACE', 5).
+        level: Log level name or int (e.g. 'DEBUG', logging.DEBUG).
                Defaults to env LOG_LEVEL or 'INFO'.
         log_file: Path to log file. Defaults to logs/sophos_central.log.
     """
     log_level = level or os.environ.get("LOG_LEVEL", "INFO")
     if isinstance(log_level, str):
-        if log_level.upper() == "TRACE":
-            log_level = TRACE
-        else:
-            log_level = getattr(logging, log_level.upper(), logging.INFO)
+        log_level = getattr(logging, log_level.upper(), logging.INFO)
 
     path = log_file or _LOG_FILE
     log_dir = os.path.dirname(path)

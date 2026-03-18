@@ -1,11 +1,47 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "sophos-central"
-version = "0.1.0"
-description = "Add your description here"
+name = "sophos-central-firewall-sdk"
+version = "0.1.1"
+description = "CLI and Python API for Sophos Central (firewalls, licenses, alerts, firmware)"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [
+    { name = "Alan Toews", email = "your.alan@toews.io" }
+]
+keywords = ["sophos", "central", "firewall", "api", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "dotenv>=0.9.9",
+    "openpyxl>=3.1.0",
     "requests>=2.32.5",
+]
+
+[project.optional-dependencies]
+dev = [
     "ruff>=0.15.0",
 ]
+
+[project.scripts]
+sophos-central = "main:main"
+sophos-central-export-csv = "export_to_csv:main"
+sophos-central-sync-db = "sync_to_db:main"
+
+[tool.setuptools]
+py-modules = ["main", "export_to_csv", "sync_to_db"]
+
+[tool.setuptools.packages.find]
+include = ["central*"]

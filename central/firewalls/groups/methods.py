@@ -1,5 +1,4 @@
 import logging
-from typing import List
 from central.session import CentralSession
 from central.firewalls.groups.classes import Group, Groups
 
