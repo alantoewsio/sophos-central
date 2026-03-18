@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sophos-central-firewall-sdk"
-version = "0.1.1"
+version = "0.1.2"
 description = "CLI and Python API for Sophos Central (firewalls, licenses, alerts, firmware)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -37,11 +37,10 @@ dev = [
 
 [project.scripts]
 sophos-central = "main:main"
-sophos-central-export-csv = "export_to_csv:main"
 sophos-central-sync-db = "sync_to_db:main"
 
 [tool.setuptools]
-py-modules = ["main", "export_to_csv", "sync_to_db"]
+py-modules = ["main", "sync_to_db"]
 
 [tool.setuptools.packages.find]
 include = ["central*"]

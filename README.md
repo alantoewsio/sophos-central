@@ -27,8 +27,7 @@ Create a `.env` or `credentials.env` in your working directory with:
 After installation, the following commands are available:
 
 - **sophos-central** – main CLI (firewalls, groups, licenses, firmware checks)
-- **sophos-central-export-csv** – export data to CSV
-- **sophos-central-sync-db** – sync data to SQLite (see [Sync to DB](#sync-to-db) below)
+- **sophos-central-sync-db** – sync data to SQLite; use `--export-xlsx` to export all tables to Excel after sync (see [Sync to DB](#sync-to-db))
 
 ### Python API (SDK)
 

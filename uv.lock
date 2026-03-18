@@ -159,8 +159,8 @@ wheels = [
 ]
 
 [[package]]
-name = "sophos-central"
-version = "0.1.0"
+name = "sophos-central-firewall-sdk"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "dotenv" },
