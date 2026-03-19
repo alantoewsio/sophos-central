@@ -1,4 +1,4 @@
-# sophos-central
+# sfos-central-sdk
 
 CLI and Python API for [Sophos Central](https://www.sophos.com/products/central), including firewalls, licenses, alerts, and firmware management.
 
@@ -10,7 +10,7 @@ CLI and Python API for [Sophos Central](https://www.sophos.com/products/central)
 ## Installation
 
 ```bash
-pip install sophos-central
+pip install sfos-central-sdk
 ```
 
 ## Configuration
