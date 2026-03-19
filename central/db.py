@@ -60,27 +60,60 @@ def get_new_alert_ids(
     return [row[0] for row in cur.fetchall()]
 
 
+# Pre-built queries for get_run_summary (table names are fixed; no user input).
+_RUN_SUMMARY_TABLES = (
+    "tenants",
+    "firewalls",
+    "licenses",
+    "license_subscriptions",
+    "alerts",
+    "alert_details",
+    "firmware_upgrades",
+    "firmware_versions",
+)
+_RUN_SUMMARY_QUERIES = {
+    "tenants": (
+        "SELECT COUNT(*) FROM tenants WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM tenants WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "firewalls": (
+        "SELECT COUNT(*) FROM firewalls WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM firewalls WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "licenses": (
+        "SELECT COUNT(*) FROM licenses WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM licenses WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "license_subscriptions": (
+        "SELECT COUNT(*) FROM license_subscriptions WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM license_subscriptions WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "alerts": (
+        "SELECT COUNT(*) FROM alerts WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM alerts WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "alert_details": (
+        "SELECT COUNT(*) FROM alert_details WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM alert_details WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "firmware_upgrades": (
+        "SELECT COUNT(*) FROM firmware_upgrades WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM firmware_upgrades WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "firmware_versions": (
+        "SELECT COUNT(*) FROM firmware_versions WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM firmware_versions WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+}
+
+
 def get_run_summary(conn: sqlite3.Connection, sync_id: str) -> dict[str, dict[str, int]]:
     """Return per-table counts of records added and updated in the run with the given sync_id."""
     summary: dict[str, dict[str, int]] = {}
-    for table in (
-        "tenants",
-        "firewalls",
-        "licenses",
-        "license_subscriptions",
-        "alerts",
-        "alert_details",
-        "firmware_upgrades",
-        "firmware_versions",
-    ):
-        added_cur = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE sync_id = ? AND first_sync = last_sync",
-            (sync_id,),
-        )
-        updated_cur = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
-            (sync_id,),
-        )
+    for table in _RUN_SUMMARY_TABLES:
+        added_sql, updated_sql = _RUN_SUMMARY_QUERIES[table]
+        added_cur = conn.execute(added_sql, (sync_id,))
+        updated_cur = conn.execute(updated_sql, (sync_id,))
         summary[table] = {
             "added": added_cur.fetchone()[0],
             "updated": updated_cur.fetchone()[0],

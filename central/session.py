@@ -15,6 +15,9 @@ from central.classes import (
 _auth_url = "https://id.sophos.com/api/v2/oauth2/token"
 _whoami_url = "https://api.central.sophos.com/whoami/v1"
 
+# Default timeout in seconds for HTTP requests (avoids hanging on unresponsive servers).
+_REQUEST_TIMEOUT = 30
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +40,9 @@ class CentralSession:
         logger.debug("Posting token request to %s", _auth_url)
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         payload = f"grant_type=client_credentials&client_id={self.client_id}&client_secret={self.client_secret}&scope=token"
-        response = requests.post(_auth_url, headers=headers, data=payload)
+        response = requests.post(
+            _auth_url, headers=headers, data=payload, timeout=_REQUEST_TIMEOUT
+        )
         if response.status_code != 200:
             logger.error(
                 "Authentication failed: status=%s body=%s",
@@ -63,7 +68,9 @@ class CentralSession:
 
         logger.debug("Calling whoami: %s", _whoami_url)
         headers = {"Authorization": f"Bearer {self.jwt}"}
-        response = requests.get(_whoami_url, headers=headers)
+        response = requests.get(
+            _whoami_url, headers=headers, timeout=_REQUEST_TIMEOUT
+        )
         if response.status_code != 200:
             logger.error(
                 "Whoami failed: status=%s body=%s",
@@ -207,7 +214,9 @@ class CentralSession:
             if next_key is not None:
                 # Key-based pagination (e.g. Common API alerts)
                 while next_key:
-                    logger.debug("Fetching next page of %s (key=%s)", url_path, next_key)
+                    logger.debug(
+                        "Fetching next page of %s (key=%s)", url_path, next_key
+                    )
                     page_params = dict(params or {})
                     page_params["pageFromKey"] = next_key
                     result = self.get_page(
@@ -233,7 +242,12 @@ class CentralSession:
                 page_num = 1
                 total = getattr(pages, "total", None)
                 current = getattr(pages, "current", None)
-                while result and total is not None and current is not None and current < total:
+                while (
+                    result
+                    and total is not None
+                    and current is not None
+                    and current < total
+                ):
                     page_num += 1
                     logger.debug("Fetching page %d of %s", page_num, url_path)
                     result = self.get_page(
@@ -290,7 +304,9 @@ class CentralSession:
         #   print(f"get from url: {full_url} - tenant: {headers['X-Tenant-ID']}")
         # if "X-Partner-ID" in headers:
         #     print(f"get from url: {full_url} - partner: {headers['X-Partner-ID']}")
-        response = requests.get(full_url, headers=headers)
+        response = requests.get(
+            full_url, headers=headers, timeout=_REQUEST_TIMEOUT
+        )
         central_response = CentralResponse(response)
         if not central_response.success:
             logger.debug(
@@ -317,7 +333,9 @@ class CentralSession:
         full_url = self._get_url(url_base, url_path, params)
         headers = self._add_base_headers(tenant_id=tenant_id)
 
-        response = requests.patch(full_url, headers=headers, json=payload)
+        response = requests.patch(
+            full_url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT
+        )
         central_response = CentralResponse(response)
         return ReturnState(success=central_response.success, value=central_response)
 
@@ -340,7 +358,9 @@ class CentralSession:
             organization_id=organization_id,
         )
 
-        response = requests.post(full_url, headers=headers, json=payload)
+        response = requests.post(
+            full_url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT
+        )
         central_response = CentralResponse(response)
         return ReturnState(success=central_response.success, value=central_response)
 
@@ -362,6 +382,8 @@ class CentralSession:
             partner_id=partner_id,
             organization_id=organization_id,
         )
-        response = requests.delete(full_url, headers=headers, json=payload)
+        response = requests.delete(
+            full_url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT
+        )
         central_response = CentralResponse(response)
         return ReturnState(success=central_response.success, value=central_response)

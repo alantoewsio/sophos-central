@@ -9,9 +9,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sqlite3
 import sys
 import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,6 +48,24 @@ DEFAULT_LOG_LEVEL = "INFO"
 LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 logger = logging.getLogger(__name__)
+
+
+class CentralSyncAuthError(Exception):
+    """Raised when Sophos Central authentication fails during a credentials DB sync."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialsSyncResult:
+    """Outcome of one credentials sync run (see ``sync_client_credentials_to_database``)."""
+
+    sync_id: str
+    summary: dict[str, dict[str, int]]
+    elapsed_by_table: dict[str, float]
+    total_elapsed: float
 
 
 def get_creds() -> dict:
@@ -227,6 +248,18 @@ SUMMARY_TABLES = (
     "firmware_versions",
 )
 
+# Pre-built SELECT * queries per table (table names are fixed; no user input).
+_SELECT_ALL_QUERIES = {
+    "tenants": "SELECT * FROM tenants",
+    "firewalls": "SELECT * FROM firewalls",
+    "licenses": "SELECT * FROM licenses",
+    "license_subscriptions": "SELECT * FROM license_subscriptions",
+    "alerts": "SELECT * FROM alerts",
+    "alert_details": "SELECT * FROM alert_details",
+    "firmware_upgrades": "SELECT * FROM firmware_upgrades",
+    "firmware_versions": "SELECT * FROM firmware_versions",
+}
+
 # Excel sheet names must be <= 31 chars; our table names fit
 _XLSX_SHEET_NAME_MAX = 31
 
@@ -236,7 +269,7 @@ def export_db_to_xlsx(conn, out_path: Path) -> None:
     wb = Workbook()
     first = True
     for table in SUMMARY_TABLES:
-        cur = conn.execute(f"SELECT * FROM {table}")
+        cur = conn.execute(_SELECT_ALL_QUERIES[table])
         rows = cur.fetchall()
         col_names = [d[0] for d in cur.description]
         sheet_name = table[:_XLSX_SHEET_NAME_MAX]
@@ -683,9 +716,104 @@ def sync_tenant(
         )
 
 
+@contextmanager
+def _quiet_sync_cli_loggers(quiet: bool):
+    """When quiet, swallow central.* logs (including this module) so nothing reaches root/stderr."""
+    if not quiet:
+        yield
+        return
+    targets = (logging.getLogger("central"),)
+    saved: list[tuple[logging.Logger, list[logging.Handler], bool]] = []
+    for lg in targets:
+        saved.append((lg, lg.handlers[:], lg.propagate))
+        lg.handlers = [logging.NullHandler()]
+        lg.propagate = False
+    try:
+        yield
+    finally:
+        for lg, handlers, prop in saved:
+            lg.handlers = handlers
+            lg.propagate = prop
+
+
+def sync_client_credentials_to_database(
+    conn: sqlite3.Connection,
+    client_id: str,
+    client_secret: str,
+    *,
+    quiet: bool = True,
+    progress: SyncProgress | None = None,
+) -> CredentialsSyncResult:
+    """
+    Sync one Sophos Central API credential (partner or tenant) into an open SQLite connection.
+
+    Call ``init_schema(conn)`` at least once on ``conn`` before the first sync.
+
+    * **quiet=True** (default): no terminal output (no progress bar, no log lines to CLI).
+      Use this when embedding from another app that already holds ``conn``.
+    * **quiet=False**: same logging/progress behavior as the CLI (configure logging first;
+      pass a ``SyncProgress`` instance for a TTY progress bar).
+
+    Returns a :class:`CredentialsSyncResult`. Commits the connection on success.
+    Raises :class:`CentralSyncAuthError` if authentication fails.
+    """
+    client_id, client_secret = client_id.strip(), client_secret.strip()
+    use_progress = None if quiet else progress
+
+    with _quiet_sync_cli_loggers(quiet):
+        if not quiet:
+            logger.info("Authenticating with Sophos Central")
+        central = CentralSession(client_id, client_secret)
+        auth_result = central.authenticate()
+        if not auth_result.success:
+            raise CentralSyncAuthError(auth_result.message or "Authentication failed")
+        if not quiet:
+            logger.info(
+                "Authenticated as %s '%s'",
+                central.whoami.idType,
+                central.whoami.id,
+            )
+
+        update_id = uuid.uuid4().hex
+        run_timestamp = _now_utc()
+        sync_start = time.perf_counter()
+        elapsed_by_table: dict[str, float] = {t: 0.0 for t in SUMMARY_TABLES}
+
+        if central.whoami.idType == "partner":
+            sync_partner(
+                conn,
+                central,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                elapsed_by_table=elapsed_by_table,
+                progress=use_progress,
+            )
+        else:
+            sync_tenant(
+                conn,
+                central,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                elapsed_by_table=elapsed_by_table,
+                progress=use_progress,
+            )
+
+        total_elapsed = time.perf_counter() - sync_start
+        conn.commit()
+        summary = get_run_summary(conn, update_id)
+
+    return CredentialsSyncResult(
+        sync_id=update_id,
+        summary=summary,
+        elapsed_by_table=elapsed_by_table,
+        total_elapsed=total_elapsed,
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Sync Sophos Central tenants, firewalls, licenses, alerts, and firmware info to SQLite"
+        prog="central-sync-to-db",
+        description="Sync Sophos Central tenants, firewalls, licenses, alerts, and firmware info to SQLite",
     )
     p.add_argument(
         "-l",
@@ -765,60 +893,33 @@ def main() -> None:
             run_label = f"creds {idx}/{len(sources)}"
             if len(sources) > 1:
                 logger.info("Sync run %s", run_label)
-            logger.info("Authenticating with Sophos Central")
-            central = CentralSession(client_id, client_secret)
-            auth_result = central.authenticate()
-            if not auth_result.success:
-                logger.error("Authentication failed: %s", auth_result.message)
+            try:
+                result = sync_client_credentials_to_database(
+                    conn,
+                    client_id,
+                    client_secret,
+                    quiet=False,
+                    progress=progress,
+                )
+            except CentralSyncAuthError as e:
+                logger.error("Authentication failed: %s", e.message)
                 raise SystemExit(1)
 
-            logger.info(
-                "Authenticated as %s '%s'",
-                central.whoami.idType,
-                central.whoami.id,
-            )
-
-            update_id = uuid.uuid4().hex
-            run_timestamp = _now_utc()
-            sync_start = time.perf_counter()
-            elapsed_by_table = {t: 0.0 for t in SUMMARY_TABLES}
-
-            if central.whoami.idType == "partner":
-                sync_partner(
-                    conn,
-                    central,
-                    update_id=update_id,
-                    run_timestamp=run_timestamp,
-                    elapsed_by_table=elapsed_by_table,
-                    progress=progress,
-                )
-            else:
-                sync_tenant(
-                    conn,
-                    central,
-                    update_id=update_id,
-                    run_timestamp=run_timestamp,
-                    elapsed_by_table=elapsed_by_table,
-                    progress=progress,
-                )
-            total_elapsed = time.perf_counter() - sync_start
-            conn.commit()
-            summary = get_run_summary(conn, update_id)
             logger.info("Sync completed. Database: %s", args.db.resolve())
-            total_added = sum(s["added"] for s in summary.values())
-            total_updated = sum(s["updated"] for s in summary.values())
+            total_added = sum(s["added"] for s in result.summary.values())
+            total_updated = sum(s["updated"] for s in result.summary.values())
             progress.clear()
             if len(sources) > 1:
                 print(f"--- {run_label} ---")
-            print(f"sync_id: {update_id}")
+            print(f"sync_id: {result.sync_id}")
             print("Summary:")
-            for table, counts in summary.items():
-                duration = _format_duration(elapsed_by_table.get(table, 0))
+            for table, counts in result.summary.items():
+                duration = _format_duration(result.elapsed_by_table.get(table, 0))
                 print(
                     f"  {table}: {counts['added']} added, {counts['updated']} updated ({duration})"
                 )
             print(
-                f"  Total: {total_added} added, {total_updated} updated (sync: {_format_duration(total_elapsed)})"
+                f"  Total: {total_added} added, {total_updated} updated (sync: {_format_duration(result.total_elapsed)})"
             )
         if args.export_xlsx is not None:
             xlsx_path = (

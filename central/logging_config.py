@@ -21,7 +21,7 @@ def configure_logging(
 ) -> None:
     """
     Configure application logging with a file handler.
-    Call once at application startup (e.g. from main.py).
+    Call once at application startup (e.g. from example.py or central.sync_to_db).
 
     Args:
         level: Log level name or int (e.g. 'DEBUG', logging.DEBUG).
@@ -48,5 +48,5 @@ def configure_logging(
         root.addHandler(fh)
 
     # Ensure our package loggers propagate and use root level
-    for name in ("central", "main"):
+    for name in ("central", "example", "central.sync_to_db"):
         logging.getLogger(name).setLevel(log_level)

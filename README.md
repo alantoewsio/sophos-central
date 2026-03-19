@@ -24,10 +24,9 @@ Create a `.env` or `credentials.env` in your working directory with:
 
 ### CLI
 
-After installation, the following commands are available:
+After installation, the **central-sync-to-db** command syncs data to SQLite; use `--export-xlsx` to export all tables to Excel after sync (see [Sync to DB](#sync-to-db)).
 
-- **sophos-central** – main CLI (firewalls, groups, licenses, firmware checks)
-- **sophos-central-sync-db** – sync data to SQLite; use `--export-xlsx` to export all tables to Excel after sync (see [Sync to DB](#sync-to-db))
+The repo includes **`example.py`**: run `python example.py` (or `uv run python example.py`) from the project root with `.env` / `credentials.env` for a demo of firewalls, groups, licenses, and firmware checks via the Python API.
 
 ### Python API (SDK)
 
@@ -183,19 +182,19 @@ central.authenticate()
 
 ### Sync to DB
 
-The **sophos-central-sync-db** command (and `sync_to_db.py` when run locally) syncs Sophos Central data into a local SQLite database: tenants, firewalls, licenses, alerts, alert details, and firmware upgrade/version info. Existing rows are updated, new ones inserted. Useful for reporting, dashboards, or offline analysis.
+The **central-sync-to-db** command (module `central.sync_to_db`) syncs Sophos Central data into a local SQLite database: tenants, firewalls, licenses, alerts, alert details, and firmware upgrade/version info. Existing rows are updated, new ones inserted. Useful for reporting, dashboards, or offline analysis.
 
 **Invocation**
 
 ```bash
-sophos-central-sync-db [OPTIONS]
+central-sync-to-db [OPTIONS]
 ```
 
-Or from the project root:
+Or as a module:
 
 ```bash
-uv run sync_to_db.py [OPTIONS]
-python -m sync_to_db [OPTIONS]
+uv run python -m central.sync_to_db [OPTIONS]
+python -m central.sync_to_db [OPTIONS]
 ```
 
 **What gets synced**
@@ -228,25 +227,25 @@ If no valid credentials are found, the script exits with an error.
 
 ```bash
 # Default: use .env/credentials.env, write to sophos_central.db
-sophos-central-sync-db
+central-sync-to-db
 
 # Custom database path and log level
-sophos-central-sync-db -d /data/sophos.db -l DEBUG
+central-sync-to-db -d /data/sophos.db -l DEBUG
 
 # Inline credentials
-sophos-central-sync-db --client-id "..." --client-secret "..."
+central-sync-to-db --client-id "..." --client-secret "..."
 
 # Use a specific env file
-sophos-central-sync-db -e ./prod.env
+central-sync-to-db -e ./prod.env
 
 # Sync then export all tables to Excel (default path: sophos_central.xlsx)
-sophos-central-sync-db -x
+central-sync-to-db -x
 
 # Sync to a DB and export to a named Excel file
-sophos-central-sync-db -d reports/sophos.db -x reports/sophos_export.xlsx
+central-sync-to-db -d reports/sophos.db -x reports/sophos_export.xlsx
 
 # Multiple env files = multiple sync runs into the same DB
-sophos-central-sync-db -e tenant1.env -e tenant2.env
+central-sync-to-db -e tenant1.env -e tenant2.env
 ```
 
 **Output**
@@ -258,6 +257,32 @@ sophos-central-sync-db -e tenant1.env -e tenant2.env
 
 The script creates/updates tables: `tenants`, `firewalls`, `licenses`, `license_subscriptions`, `alerts`, `alert_details`, `firmware_upgrades`, `firmware_versions`. Schema is managed by `central.db` (e.g. `init_schema`). The same tables are exported when using `--export-xlsx`.
 
+**Programmatic sync (shared DB connection)**
+
+If you already have an open SQLite connection and credentials, import from `central.sync_to_db`:
+
+```python
+from central.db import get_connection, init_schema
+from central.sync_to_db import (
+    sync_client_credentials_to_database,
+    CentralSyncAuthError,
+)
+
+conn = get_connection("sophos_central.db")
+init_schema(conn)
+try:
+    result = sync_client_credentials_to_database(
+        conn, client_id, client_secret
+    )  # default quiet=True: no progress bar or console log lines from the sync
+    # result.sync_id, result.summary, result.elapsed_by_table, result.total_elapsed
+finally:
+    conn.close()
+```
+
+On auth failure, `CentralSyncAuthError` is raised. Use `quiet=False` (and optional `progress=SyncProgress()` from `central.sync_to_db`) to mirror CLI logging/progress.
+
+**Note (v0.2+):** The sync CLI/API lives under `central.sync_to_db`. Replace former `from sync_to_db import …` with `from central.sync_to_db import …`.
+
 ---
 
 ## Development
@@ -266,6 +291,8 @@ Install with dev dependencies:
 
 ```bash
 pip install -e ".[dev]"
+# or with uv (matches CI):
+uv sync --extra dev
 ```
 
 Run the linter:
@@ -273,6 +300,40 @@ Run the linter:
 ```bash
 ruff check .
 ```
+
+### Security scanning (no cost)
+
+- **Dependency vulnerabilities:** [pip-audit](https://pypi.org/project/pip-audit/) checks installed packages against the [Python Packaging Advisory Database](https://github.com/pypa/advisory-database). Run:
+  ```bash
+  uv run pip-audit
+  ```
+- **Code security:** [Bandit](https://bandit.readthedocs.io/) is included in dev dependencies. Run:
+  ```bash
+  uv run bandit -c pyproject.toml -r central example.py
+  ```
+- **CI:** The repo includes a GitHub Actions workflow (`.github/workflows/security.yml`) that runs pip-audit and Bandit on push/PR to `master`/`main` and weekly on a schedule. Free for public repos; private repos get a monthly Actions allowance.
+
+## Licensing
+
+This project is licensed under the Apache License 2.0 (see [License](#license) below). Third-party dependencies and their licenses are listed below.
+
+### Runtime dependencies
+
+| Package   | Version  | License   |
+|----------|----------|-----------|
+| dotenv   | ≥0.9.9   | Unspecified on PyPI (thin wrapper; depends on **python-dotenv**, BSD-3-Clause) |
+| openpyxl | ≥3.1.0   | MIT       |
+| requests | ≥2.32.5  | Apache-2.0 |
+
+### Dev dependencies
+
+| Package       | Version  | License    |
+|---------------|----------|------------|
+| ruff          | ≥0.15.0  | MIT        |
+| pytest        | ≥8.0.0   | MIT        |
+| pytest-cov    | ≥5.0.0   | MIT        |
+| bandit[toml]  | ≥1.7.0   | Apache-2.0 |
+| pip-audit     | ≥2.0.0   | Apache-2.0 |
 
 ## License
 

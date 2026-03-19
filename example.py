@@ -1,3 +1,7 @@
+"""
+Example CLI demonstrating Sophos Central API usage (firewalls, groups, licenses, firmware).
+Run from the project root with credentials in `.env` or `credentials.env`.
+"""
 from __future__ import annotations
 import argparse
 from datetime import datetime
@@ -115,7 +119,7 @@ def print_license_summary(licenses: List[License]):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Sophos Central API client")
+    parser = argparse.ArgumentParser(description="Sophos Central API example client")
     parser.add_argument(
         "-l",
         "--log-level",
