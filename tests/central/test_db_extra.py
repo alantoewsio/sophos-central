@@ -17,6 +17,7 @@ def test_upsert_tenant_contact_exception_path(db_conn):
             "name": "n",
             "contact": BadContact(),
         },
+        client_id="oauth-cid",
         update_id="u",
         run_timestamp="t",
     )
@@ -29,6 +30,7 @@ def test_upsert_tenant_contact_dict_without_get(db_conn):
     db.upsert_tenant(
         db_conn,
         {"id": "tx", "name": "n", "contact": M()},
+        client_id="oauth-cid",
         update_id="u",
         run_timestamp="t",
     )
@@ -60,4 +62,6 @@ def test_upsert_license_usage_date_string(db_conn):
         modelType="hardware",
         licenses=[sub],
     )
-    db.upsert_license(db_conn, lic, update_id="u", run_timestamp="t")
+    db.upsert_license(
+        db_conn, lic, client_id="oauth-cid", update_id="u", run_timestamp="t"
+    )

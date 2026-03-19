@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -141,23 +142,64 @@ def _format_duration(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
+def _try_enable_windows_console_vt() -> None:
+    """Enable ANSI escape processing on Windows conhost (needed for clear-line progress)."""
+    if sys.platform != "win32":
+        return
+    if not sys.stdout.isatty():
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            return
+        vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if mode.value & vt:
+            return
+        kernel32.SetConsoleMode(h, mode.value | vt)
+    except Exception:
+        return
+
+
+def _progress_erase_prefix() -> str:
+    """Return prefix to move to start of line and clear it (or plain CR if disabled)."""
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM", "").lower() == "dumb":
+        return "\r"
+    return "\r\x1b[2K"
+
+
 class SyncProgress:
     """Single-line progress bar and step message for CLI. Clears before summary.
-    Keeps output under 79 chars so \\r overwrites the same line (no wrap).
+    Width follows the terminal so the line does not wrap (wrap breaks \\r updates).
+    Uses CSI clear-line when supported so shorter messages do not leave stale text.
     """
 
     BAR_WIDTH = 20
-    # Stay under 79 so the line never wraps; \r then overwrites correctly
+    # Hard cap for very wide terminals; real width is min(this, columns - 1)
     MAX_LINE = 79
 
     def __init__(self) -> None:
         self._visible = sys.stdout.isatty()
+        if self._visible:
+            _try_enable_windows_console_vt()
         self._total = 0
         self._current = 0
         self._message = ""
 
     def set_total(self, n: int) -> None:
         self._total = max(0, n)
+
+    def _terminal_width(self) -> int:
+        """Usable width for one logical line (avoid wrap so \\r stays on one visual row)."""
+        try:
+            cols = shutil.get_terminal_size().columns
+        except OSError:
+            cols = self.MAX_LINE + 1
+        inner = max(1, cols - 1)
+        return min(self.MAX_LINE, inner)
 
     def update(self, message: str, current: int | None = None) -> None:
         if not self._visible:
@@ -168,6 +210,7 @@ class SyncProgress:
         self._render()
 
     def _render(self) -> None:
+        max_line = self._terminal_width()
         if self._total > 0:
             filled = min(
                 self.BAR_WIDTH - 2,  # leave room for ">"
@@ -178,21 +221,30 @@ class SyncProgress:
         else:
             bar = "[" + " " * self.BAR_WIDTH + "]"
             frac = ""
-        # Bar + fraction is fixed width; truncate message so whole line <= MAX_LINE
+        # Bar + fraction is fixed width; truncate message so whole line fits terminal
         prefix_len = len(bar) + len(frac) + 2  # "  "
-        max_msg = max(1, self.MAX_LINE - prefix_len)
+        max_msg = max(1, max_line - prefix_len)
         if len(self._message) > max_msg:
             msg = self._message[: max_msg - 3] + "..."
         else:
             msg = self._message
         line = bar + frac + "  " + msg
-        sys.stdout.write("\r" + line.ljust(self.MAX_LINE))
+        if len(line) > max_line:
+            line = line[:max_line]
+        erase = _progress_erase_prefix()
+        if erase == "\r":
+            line = line.ljust(max_line)
+        sys.stdout.write(erase + line)
         sys.stdout.flush()
 
     def clear(self) -> None:
         if not self._visible:
             return
-        sys.stdout.write("\r" + " " * self.MAX_LINE + "\r")
+        erase = _progress_erase_prefix()
+        if erase == "\r":
+            sys.stdout.write("\r" + " " * self._terminal_width() + "\r")
+        else:
+            sys.stdout.write(erase)
         sys.stdout.flush()
 
 
@@ -216,6 +268,7 @@ def ensure_tenant_record(
     whoami_id: str,
     name: str = "Current tenant",
     *,
+    client_id: str,
     update_id: str,
     run_timestamp: str,
 ) -> None:
@@ -224,16 +277,26 @@ def ensure_tenant_record(
         """
         INSERT INTO tenants (
             id, show_as, name, updated_at,
-            first_sync, last_sync, sync_id
+            first_sync, last_sync, sync_id, client_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             updated_at = excluded.updated_at,
             last_sync = excluded.last_sync,
-            sync_id = excluded.sync_id
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
         """,
-        (whoami_id, name, name, _now_utc(), run_timestamp, run_timestamp, update_id),
+        (
+            whoami_id,
+            name,
+            name,
+            _now_utc(),
+            run_timestamp,
+            run_timestamp,
+            update_id,
+            client_id,
+        ),
     )
 
 
@@ -290,6 +353,7 @@ def sync_partner(
     conn,
     central: CentralSession,
     *,
+    client_id: str,
     update_id: str,
     run_timestamp: str,
     elapsed_by_table: dict[str, float] | None = None,
@@ -316,7 +380,13 @@ def sync_partner(
         if progress is not None:
             progress.update(f"Tenant {tenant.name!r}: tenant record", step)
         t0 = time.perf_counter()
-        upsert_tenant(conn, tenant, update_id=update_id, run_timestamp=run_timestamp)
+        upsert_tenant(
+            conn,
+            tenant,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+        )
         elapsed_by_table["tenants"] = elapsed_by_table.get("tenants", 0) + (
             time.perf_counter() - t0
         )
@@ -339,7 +409,11 @@ def sync_partner(
             firewalls = firewalls_result
             for fw in firewalls:
                 upsert_firewall(
-                    conn, fw, update_id=update_id, run_timestamp=run_timestamp
+                    conn,
+                    fw,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
                 )
         elapsed = time.perf_counter() - t0
         elapsed_by_table["firewalls"] = elapsed_by_table.get("firewalls", 0) + elapsed
@@ -366,6 +440,7 @@ def sync_partner(
                 upsert_license(
                     conn,
                     lic,
+                    client_id=client_id,
                     tenant_id=tenant.id,
                     update_id=update_id,
                     run_timestamp=run_timestamp,
@@ -406,6 +481,7 @@ def sync_partner(
                 upsert_alert(
                     conn,
                     alert,
+                    client_id=client_id,
                     tenant_id=tenant.id,
                     update_id=update_id,
                     run_timestamp=run_timestamp,
@@ -420,13 +496,19 @@ def sync_partner(
         )
         step += 1
 
-        if progress is not None:
-            progress.update(f"Tenant {tenant.name!r}: alert details", step)
         # Fetch and upsert full details for new alerts only
         new_alert_ids = get_new_alert_ids(conn, update_id, tenant.id)
+        if progress is not None and not new_alert_ids:
+            progress.update(f"Tenant {tenant.name!r}: alert details", step)
         if new_alert_ids:
+            n_alert_details = len(new_alert_ids)
             t0_details = time.perf_counter()
-            for aid in new_alert_ids:
+            for i, aid in enumerate(new_alert_ids, start=1):
+                if progress is not None:
+                    progress.update(
+                        f"Tenant {tenant.name!r}: alert details ({i}/{n_alert_details})",
+                        step,
+                    )
                 detail_result = get_alert(
                     central,
                     aid,
@@ -437,6 +519,7 @@ def sync_partner(
                     upsert_alert_detail(
                         conn,
                         detail_result,
+                        client_id=client_id,
                         tenant_id=tenant.id,
                         update_id=update_id,
                         run_timestamp=run_timestamp,
@@ -474,6 +557,7 @@ def sync_partner(
                     upsert_firmware_upgrade(
                         conn,
                         upgrade,
+                        client_id=client_id,
                         tenant_id=tenant.id,
                         update_id=update_id,
                         run_timestamp=run_timestamp,
@@ -482,6 +566,7 @@ def sync_partner(
                     upsert_firmware_version(
                         conn,
                         fw_ver,
+                        client_id=client_id,
                         update_id=update_id,
                         run_timestamp=run_timestamp,
                     )
@@ -519,6 +604,7 @@ def sync_partner(
             upsert_license(
                 conn,
                 lic,
+                client_id=client_id,
                 partner_id=central.whoami.id,
                 update_id=update_id,
                 run_timestamp=run_timestamp,
@@ -541,6 +627,7 @@ def sync_tenant(
     conn,
     central: CentralSession,
     *,
+    client_id: str,
     update_id: str,
     run_timestamp: str,
     elapsed_by_table: dict[str, float] | None = None,
@@ -560,6 +647,7 @@ def sync_tenant(
         conn,
         whoami.id,
         name=whoami.id,
+        client_id=client_id,
         update_id=update_id,
         run_timestamp=run_timestamp,
     )
@@ -577,7 +665,13 @@ def sync_tenant(
     else:
         firewalls_list = list(firewalls_result)
         for fw in firewalls_list:
-            upsert_firewall(conn, fw, update_id=update_id, run_timestamp=run_timestamp)
+            upsert_firewall(
+                conn,
+                fw,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
     elapsed = time.perf_counter() - t0
     elapsed_by_table["firewalls"] = elapsed_by_table.get("firewalls", 0) + elapsed
     logger.info(
@@ -597,6 +691,7 @@ def sync_tenant(
             upsert_license(
                 conn,
                 lic,
+                client_id=client_id,
                 tenant_id=whoami.id,
                 update_id=update_id,
                 run_timestamp=run_timestamp,
@@ -635,6 +730,7 @@ def sync_tenant(
             upsert_alert(
                 conn,
                 alert,
+                client_id=client_id,
                 tenant_id=whoami.id,
                 update_id=update_id,
                 run_timestamp=run_timestamp,
@@ -647,13 +743,19 @@ def sync_tenant(
         _format_duration(elapsed),
     )
 
-    if progress is not None:
-        progress.update("Alert details", 4)
     # Fetch and upsert full details for new alerts only
     new_alert_ids = get_new_alert_ids(conn, update_id, whoami.id)
+    if progress is not None and not new_alert_ids:
+        progress.update("Alert details", 4)
     if new_alert_ids:
+        n_alert_details = len(new_alert_ids)
         t0_details = time.perf_counter()
-        for aid in new_alert_ids:
+        for i, aid in enumerate(new_alert_ids, start=1):
+            if progress is not None:
+                progress.update(
+                    f"Alert details ({i}/{n_alert_details})",
+                    4,
+                )
             detail_result = get_alert(
                 central, aid, tenant_id=whoami.id, url_base=url_base
             )
@@ -661,6 +763,7 @@ def sync_tenant(
                 upsert_alert_detail(
                     conn,
                     detail_result,
+                    client_id=client_id,
                     tenant_id=whoami.id,
                     update_id=update_id,
                     run_timestamp=run_timestamp,
@@ -686,6 +789,7 @@ def sync_tenant(
                 upsert_firmware_upgrade(
                     conn,
                     upgrade,
+                    client_id=client_id,
                     tenant_id=whoami.id,
                     update_id=update_id,
                     run_timestamp=run_timestamp,
@@ -694,6 +798,7 @@ def sync_tenant(
                 upsert_firmware_version(
                     conn,
                     fw_ver,
+                    client_id=client_id,
                     update_id=update_id,
                     run_timestamp=run_timestamp,
                 )
@@ -783,6 +888,7 @@ def sync_client_credentials_to_database(
             sync_partner(
                 conn,
                 central,
+                client_id=client_id,
                 update_id=update_id,
                 run_timestamp=run_timestamp,
                 elapsed_by_table=elapsed_by_table,
@@ -792,6 +898,7 @@ def sync_client_credentials_to_database(
             sync_tenant(
                 conn,
                 central,
+                client_id=client_id,
                 update_id=update_id,
                 run_timestamp=run_timestamp,
                 elapsed_by_table=elapsed_by_table,

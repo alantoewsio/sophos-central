@@ -19,7 +19,9 @@ from central.sync_to_db import (
     _cred_sources_from_args,
     _format_duration,
     _from_time_after,
+    _progress_erase_prefix,
     _quiet_sync_cli_loggers,
+    _try_enable_windows_console_vt,
     ensure_tenant_record,
     export_db_to_xlsx,
     get_creds,
@@ -90,6 +92,134 @@ def test_cred_sources_from_args_default_creds(mock_get_creds, tmp_path: Path, mo
     assert _cred_sources_from_args(args) == [("def", "sec")]
 
 
+def test_try_enable_windows_console_vt_does_not_raise():
+    _try_enable_windows_console_vt()
+
+
+def test_progress_erase_prefix_respects_no_color(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert _progress_erase_prefix() == "\r"
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+    assert _progress_erase_prefix() == "\r"
+
+
+def test_progress_erase_prefix_ansi_sequence_when_allowed(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    assert _progress_erase_prefix() == "\r\x1b[2K"
+
+
+def test_try_enable_windows_console_vt_non_win32():
+    with patch("central.sync_to_db.sys.platform", "linux"):
+        _try_enable_windows_console_vt()
+
+
+def _patch_win32_console_mocks(mock_k: MagicMock):
+    """ctypes.windll is absent on non-Windows; inject a fake windll for tests."""
+    mock_windll = MagicMock(kernel32=mock_k)
+    return patch("ctypes.windll", mock_windll, create=True)
+
+
+def test_try_enable_windows_console_vt_sets_mode():
+    mock_k = MagicMock()
+    mock_k.GetStdHandle.return_value = 1
+    mock_k.GetConsoleMode.return_value = 1
+    mock_k.SetConsoleMode.return_value = 1
+    with patch("central.sync_to_db.sys.platform", "win32"), patch(
+        "central.sync_to_db.sys.stdout.isatty", return_value=True
+    ), _patch_win32_console_mocks(mock_k):
+        _try_enable_windows_console_vt()
+    mock_k.SetConsoleMode.assert_called_once()
+    _handle, new_mode = mock_k.SetConsoleMode.call_args[0]
+    assert new_mode & 0x0004
+
+
+def test_try_enable_windows_console_vt_skips_if_already_on():
+    mock_k = MagicMock()
+    mock_k.GetStdHandle.return_value = 1
+
+    def gcm(h, ref):
+        ref._obj.value = 0x0004
+        return 1
+
+    mock_k.GetConsoleMode.side_effect = gcm
+    with patch("central.sync_to_db.sys.platform", "win32"), patch(
+        "central.sync_to_db.sys.stdout.isatty", return_value=True
+    ), _patch_win32_console_mocks(mock_k):
+        _try_enable_windows_console_vt()
+    mock_k.SetConsoleMode.assert_not_called()
+
+
+def test_try_enable_windows_console_vt_skips_on_get_mode_fail():
+    mock_k = MagicMock()
+    mock_k.GetStdHandle.return_value = 1
+    mock_k.GetConsoleMode.return_value = 0
+    with patch("central.sync_to_db.sys.platform", "win32"), patch(
+        "central.sync_to_db.sys.stdout.isatty", return_value=True
+    ), _patch_win32_console_mocks(mock_k):
+        _try_enable_windows_console_vt()
+    mock_k.SetConsoleMode.assert_not_called()
+
+
+def test_try_enable_windows_console_vt_swallows_kernel_errors():
+    mock_k = MagicMock()
+    mock_k.GetStdHandle.side_effect = OSError("no console")
+    with patch("central.sync_to_db.sys.platform", "win32"), patch(
+        "central.sync_to_db.sys.stdout.isatty", return_value=True
+    ), _patch_win32_console_mocks(mock_k):
+        _try_enable_windows_console_vt()
+
+
+@patch("central.sync_to_db.shutil.get_terminal_size", side_effect=OSError)
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_terminal_width_oserror(mock_isatty, mock_gs, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    sp = SyncProgress()
+    sp.set_total(10)
+    sp.update("step", current=2)
+    sp.clear()
+
+
+@patch("central.sync_to_db.shutil.get_terminal_size", return_value=SimpleNamespace(columns=14))
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_render_truncates_line(mock_isatty, mock_gs, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    sp = SyncProgress()
+    sp._visible = True
+    sp.set_total(100)
+    sp.update("x" * 200, current=1)
+    sp.clear()
+
+
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_render_no_ansi_pads_line(mock_isatty, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    sp = SyncProgress()
+    sp.set_total(5)
+    sp.update("hi", current=1)
+    sp.clear()
+
+
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_clear_uses_ansi_erase(mock_isatty, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    sp = SyncProgress()
+    sp.clear()
+
+
+@patch("central.sync_to_db.shutil.get_terminal_size", return_value=SimpleNamespace(columns=8))
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_render_hard_caps_line_length(mock_isatty, mock_gs, monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    sp = SyncProgress()
+    sp._visible = True
+    sp.set_total(10)
+    sp.update("msg", current=5)
+    sp.clear()
+
+
 def test_sync_progress_non_tty():
     sp = SyncProgress()
     sp._visible = False
@@ -138,7 +268,12 @@ def test_quiet_sync_loggers():
 
 def test_ensure_tenant_record(db_conn):
     ensure_tenant_record(
-        db_conn, "w1", name="N", update_id="u", run_timestamp="t"
+        db_conn,
+        "w1",
+        name="N",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="t",
     )
 
 
@@ -171,6 +306,7 @@ def test_sync_partner_minimal(
     sync_partner(
         db_conn,
         central,
+        client_id="oauth-cid",
         update_id="u",
         run_timestamp="ts",
         progress=None,
@@ -197,6 +333,7 @@ def test_sync_partner_minimal(
         sync_partner(
             db_conn,
             central,
+            client_id="oauth-cid",
             update_id="u2",
             run_timestamp="ts",
             elapsed_by_table={},
@@ -236,12 +373,15 @@ def test_sync_partner_with_alerts_and_details(
         with patch(
             "central.sync_to_db.get_latest_alert_raised_at", return_value=None
         ):
+            pr = SyncProgress()
+            pr._visible = False
             sync_partner(
                 db_conn,
                 central,
+                client_id="oauth-cid",
                 update_id="u3",
                 run_timestamp="ts",
-                progress=None,
+                progress=pr,
             )
 
 
@@ -266,7 +406,7 @@ def test_sync_partner_licenses_fail_alerts_fail(
     mock_fw_up.return_value = ReturnState(success=False, message="fwup")
     with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
         with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
-            sync_partner(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+            sync_partner(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
 
 
 @patch("central.sync_to_db.firmware_upgrade_check")
@@ -308,6 +448,7 @@ def test_sync_partner_licenses_and_firmware_success(mock_gfw, mock_lic, mock_ale
             sync_partner(
                 db_conn,
                 central,
+                client_id="oauth-cid",
                 update_id="u",
                 run_timestamp="ts",
                 progress=progress,
@@ -329,7 +470,7 @@ def test_sync_partner_with_latest_raised_from_time(mock_gfw, mock_lic, mock_aler
     mock_fw_up.return_value = SimpleNamespace(success=True, firewalls=[], firmwareVersions=[])
     with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
         with patch("central.sync_to_db.get_latest_alert_raised_at", return_value="2024-06-01T12:00:00Z"):
-            sync_partner(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+            sync_partner(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
 
 
 @patch("central.sync_to_db.firmware_upgrade_check")
@@ -344,7 +485,7 @@ def test_sync_tenant_paths(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock
     mock_lic.return_value = ReturnState(success=False, message="e")
     mock_alerts.return_value = ReturnState(success=False, message="e")
     mock_fw_up.return_value = ReturnState(success=False, message="e")
-    sync_tenant(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+    sync_tenant(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
 
     mock_gfw.return_value = []
     mock_lic.return_value = []
@@ -355,6 +496,7 @@ def test_sync_tenant_paths(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock
             sync_tenant(
                 db_conn,
                 central,
+                client_id="oauth-cid",
                 update_id="u2",
                 run_timestamp="ts",
                 progress=SyncProgress(),
@@ -382,7 +524,16 @@ def test_sync_tenant_with_latest_raised_and_alert_details(
     )
     with patch("central.sync_to_db.get_new_alert_ids", return_value=["a1"]):
         with patch("central.sync_to_db.get_latest_alert_raised_at", return_value="2024-01-01T00:00:00Z"):
-            sync_tenant(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+            pr = SyncProgress()
+            pr._visible = False
+            sync_tenant(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="u",
+                run_timestamp="ts",
+                progress=pr,
+            )
 
 
 @patch("central.sync_to_db.firmware_upgrade_check")
@@ -421,6 +572,7 @@ def test_sync_tenant_with_progress_and_firmware_success(
             sync_tenant(
                 db_conn,
                 central,
+                client_id="oauth-cid",
                 update_id="u",
                 run_timestamp="ts",
                 progress=progress,
@@ -441,7 +593,7 @@ def test_sync_tenant_licenses_fail(mock_gfw, mock_lic, mock_alerts, mock_get_ale
     mock_fw_up.return_value = SimpleNamespace(success=True, firewalls=[], firmwareVersions=[])
     with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
         with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
-            sync_tenant(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+            sync_tenant(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
 
 
 @patch("central.sync_to_db.firmware_upgrade_check")
@@ -459,7 +611,7 @@ def test_sync_tenant_alert_detail_return_state(mock_gfw, mock_lic, mock_alerts, 
     mock_fw_up.return_value = SimpleNamespace(success=True, firewalls=[], firmwareVersions=[])
     with patch("central.sync_to_db.get_new_alert_ids", return_value=["a1"]):
         with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
-            sync_tenant(db_conn, central, update_id="u", run_timestamp="ts", progress=None)
+            sync_tenant(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
 
 
 @patch("central.sync_to_db.sync_tenant")

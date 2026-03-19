@@ -182,7 +182,7 @@ central.authenticate()
 
 ### Sync to DB
 
-The **central-sync-to-db** command (module `central.sync_to_db`) syncs Sophos Central data into a local SQLite database: tenants, firewalls, licenses, alerts, alert details, and firmware upgrade/version info. Existing rows are updated, new ones inserted. Useful for reporting, dashboards, or offline analysis.
+The **central-sync-to-db** command (module `central.sync_to_db`) syncs Sophos Central data into a local SQLite database: tenants, firewalls, licenses, alerts, alert details, and firmware upgrade/version info. Existing rows are updated, new ones inserted. Every synced table includes `client_id` (the `CENTRAL-CLIENT-ID` / OAuth client that last wrote the row), which helps when combining data from several credentials. Useful for reporting, dashboards, or offline analysis.
 
 **Invocation**
 

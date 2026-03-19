@@ -59,6 +59,28 @@ def test_get_connection_and_init_schema(tmp_path: Path):
     conn.close()
 
 
+def test_ensure_client_id_column_migrates_legacy_db(tmp_path: Path):
+    """DB from before client_id existed gets the column re-added."""
+    conn = db.get_connection(tmp_path / "legacy.db")
+    db.init_schema(conn)
+    tables = (
+        "tenants",
+        "firewalls",
+        "licenses",
+        "license_subscriptions",
+        "alerts",
+        "alert_details",
+        "firmware_upgrades",
+        "firmware_versions",
+    )
+    for t in tables:
+        conn.execute(f"ALTER TABLE {t} DROP COLUMN client_id")
+    db._ensure_client_id_column(conn)
+    for t in tables:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({t})")}
+        assert "client_id" in cols
+
+
 def test_get_new_alert_ids_and_run_summary_and_latest_raised(db_conn):
     sync_id = "s1"
     tid = "tenant1"
@@ -149,6 +171,7 @@ def test_upsert_tenant_dict_and_contact_branches(db_conn):
             "externalIds": [1],
             "products": [{"code": "FW"}, "RAW"],
         },
+        client_id="oauth-cid",
         update_id="u1",
         run_timestamp="ts",
     )
@@ -166,6 +189,7 @@ def test_upsert_tenant_dict_and_contact_branches(db_conn):
             "name": "N2",
             "contact": BadContact(),
         },
+        client_id="oauth-cid",
         update_id="u1",
         run_timestamp="ts",
     )
@@ -195,7 +219,9 @@ def test_upsert_firewall(db_conn):
         createdAt="c",
         updatedAt="u",
     )
-    db.upsert_firewall(db_conn, fw, update_id="u", run_timestamp="ts")
+    db.upsert_firewall(
+        db_conn, fw, client_id="oauth-cid", update_id="u", run_timestamp="ts"
+    )
 
     fw2 = SimpleNamespace(
         id="fw2",
@@ -217,7 +243,9 @@ def test_upsert_firewall(db_conn):
         "updatedAt",
     ):
         setattr(fw2, k, None)
-    db.upsert_firewall(db_conn, fw2, update_id="u", run_timestamp="ts")
+    db.upsert_firewall(
+        db_conn, fw2, client_id="oauth-cid", update_id="u", run_timestamp="ts"
+    )
     db_conn.commit()
 
 
@@ -246,7 +274,9 @@ def test_upsert_license_and_subscriptions(db_conn):
         licenses=[sub],
         lastSeenAt="ls",
     )
-    db.upsert_license(db_conn, lic, update_id="u", run_timestamp="ts")
+    db.upsert_license(
+        db_conn, lic, client_id="oauth-cid", update_id="u", run_timestamp="ts"
+    )
 
     lic2 = SimpleNamespace(
         serialNumber="SER2",
@@ -258,7 +288,13 @@ def test_upsert_license_and_subscriptions(db_conn):
         licenses=[],
     )
     db.upsert_license(
-        db_conn, lic2, tenant_id="tx", partner_id="px", update_id="u", run_timestamp="ts"
+        db_conn,
+        lic2,
+        client_id="oauth-cid",
+        tenant_id="tx",
+        partner_id="px",
+        update_id="u",
+        run_timestamp="ts",
     )
     db_conn.commit()
 
@@ -278,8 +314,17 @@ def test_upsert_alert_and_detail(db_conn):
         "managedAgent": {"id": "1", "type": "x"},
         "person": {"id": "2"},
     }
-    db.upsert_alert(db_conn, alert, update_id="u", run_timestamp="ts")
-    db.upsert_alert_detail(db_conn, alert, tenant_id="t1", update_id="u", run_timestamp="ts")
+    db.upsert_alert(
+        db_conn, alert, client_id="oauth-cid", update_id="u", run_timestamp="ts"
+    )
+    db.upsert_alert_detail(
+        db_conn,
+        alert,
+        client_id="oauth-cid",
+        tenant_id="t1",
+        update_id="u",
+        run_timestamp="ts",
+    )
     db_conn.commit()
 
 
@@ -291,15 +336,27 @@ def test_upsert_firmware_upgrade_and_version(db_conn):
         upgradeToVersion=[{"v": "1"}],
     )
     db.upsert_firmware_upgrade(
-        db_conn, up, tenant_id="t1", update_id="u", run_timestamp="ts"
+        db_conn,
+        up,
+        client_id="oauth-cid",
+        tenant_id="t1",
+        update_id="u",
+        run_timestamp="ts",
     )
     up2 = SimpleNamespace(id="fwu2", serialNumber="SN2", upgradeToVersion=[])
     db.upsert_firmware_upgrade(
-        db_conn, up2, tenant_id="t1", update_id="u", run_timestamp="ts"
+        db_conn,
+        up2,
+        client_id="oauth-cid",
+        tenant_id="t1",
+        update_id="u",
+        run_timestamp="ts",
     )
 
     fv = SimpleNamespace(version="19.0", size="1M", bugs=["b"], news=["n"])
-    db.upsert_firmware_version(db_conn, fv, update_id="u", run_timestamp="ts")
+    db.upsert_firmware_version(
+        db_conn, fv, client_id="oauth-cid", update_id="u", run_timestamp="ts"
+    )
     db_conn.commit()
 
 
