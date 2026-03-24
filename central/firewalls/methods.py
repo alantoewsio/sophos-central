@@ -280,11 +280,10 @@ def schedule_firmware_upgrade(
         firewall_id,
         upgradeToVersion,
     )
-    payload = {
-        "id": firewall_id,
-        "upgradeToVersion": upgradeToVersion,
-        "upgradeAt": upgrade_at,
-    }
+    entry = {"id": firewall_id, "upgradeToVersion": upgradeToVersion}
+    if upgrade_at is not None:
+        entry["upgradeAt"] = upgrade_at
+    payload = {"firewalls": [entry]}
     response = central.post(
         "/firewall/v1/firewalls/actions/firmware-upgrade",
         payload=payload,

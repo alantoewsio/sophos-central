@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from central.classes import ReturnState
+from central.firewalls.groups.classes import FirewallID, FirewallSyncStatus
 from central.sync_to_db import (
     CentralSyncAuthError,
     CredentialsSyncResult,
@@ -21,6 +22,7 @@ from central.sync_to_db import (
     _from_time_after,
     _progress_erase_prefix,
     _quiet_sync_cli_loggers,
+    _sync_mdr_threat_feed_for_firewall,
     _try_enable_windows_console_vt,
     ensure_tenant_record,
     export_db_to_xlsx,
@@ -30,6 +32,20 @@ from central.sync_to_db import (
     sync_client_credentials_to_database,
     sync_partner,
     sync_tenant,
+)
+
+_SUMMARY_TABLE_KEYS = (
+    "tenants",
+    "firewalls",
+    "licenses",
+    "license_subscriptions",
+    "alerts",
+    "alert_details",
+    "firmware_upgrades",
+    "firmware_versions",
+    "firewall_groups",
+    "firewall_group_sync_status",
+    "mdr_threat_feed_sync",
 )
 
 
@@ -647,6 +663,8 @@ def test_parse_args():
     with patch.object(sys, "argv", ["prog", "--db", "x.db"]):
         a = parse_args()
         assert a.db == Path("x.db")
+    with patch.object(sys, "argv", ["prog", "--db", "x.db", "--mdr"]):
+        assert parse_args().mdr is True
 
 
 @patch("central.sync_to_db.sync_client_credentials_to_database")
@@ -661,14 +679,8 @@ def test_main_happy_path(mock_cs, mock_cfg, mock_init, mock_conn, mock_sync, tmp
     mock_cs.return_value = [("a", "b")]
     mock_sync.return_value = CredentialsSyncResult(
         "sid",
-        {k: {"added": 0, "updated": 0} for k in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
-        {k: 0.0 for k in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
+        {k: {"added": 0, "updated": 0} for k in _SUMMARY_TABLE_KEYS},
+        {k: 0.0 for k in _SUMMARY_TABLE_KEYS},
         1.0,
     )
     with patch.object(sys, "argv", ["prog", "--db", str(dbf)]):
@@ -732,10 +744,7 @@ def test_main_export_xlsx(
     mock_conn.return_value = MagicMock()
     mock_sync.return_value = CredentialsSyncResult(
         "s",
-        {t: {"added": 0, "updated": 0} for t in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
+        {t: {"added": 0, "updated": 0} for t in _SUMMARY_TABLE_KEYS},
         {},
         0.0,
     )
@@ -761,10 +770,7 @@ def test_main_export_xlsx_default_path(
     mock_conn.return_value = MagicMock()
     mock_sync.return_value = CredentialsSyncResult(
         "s",
-        {t: {"added": 0, "updated": 0} for t in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
+        {t: {"added": 0, "updated": 0} for t in _SUMMARY_TABLE_KEYS},
         {},
         0.0,
     )
@@ -789,14 +795,8 @@ def test_main_multi_sources_print(
     mock_conn.return_value = MagicMock()
     mock_sync.return_value = CredentialsSyncResult(
         "s",
-        {t: {"added": 1, "updated": 0} for t in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
-        {t: 0.01 for t in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
+        {t: {"added": 1, "updated": 0} for t in _SUMMARY_TABLE_KEYS},
+        {t: 0.01 for t in _SUMMARY_TABLE_KEYS},
         0.1,
     )
     with patch.object(sys, "argv", ["prog", "--db", str(tmp_path / "m.db")]):
@@ -815,10 +815,7 @@ def test_main_default_creds(mock_cfg, mock_init, mock_conn, mock_sync, tmp_path,
     mock_conn.return_value = MagicMock()
     mock_sync.return_value = CredentialsSyncResult(
         "s",
-        {t: {"added": 0, "updated": 0} for t in (
-            "tenants", "firewalls", "licenses", "license_subscriptions",
-            "alerts", "alert_details", "firmware_upgrades", "firmware_versions",
-        )},
+        {t: {"added": 0, "updated": 0} for t in _SUMMARY_TABLE_KEYS},
         {},
         0.0,
     )
@@ -861,3 +858,666 @@ def test_sync_quiet_false_with_progress(db_conn):
             sync_client_credentials_to_database(
                 db_conn, "a", "b", quiet=False, progress=SyncProgress()
             )
+
+
+def test_sync_client_credentials_passes_sync_mdr(db_conn):
+    with patch("central.sync_to_db.sync_tenant") as mock_st:
+        central = MagicMock()
+        central.authenticate.return_value = SimpleNamespace(success=True)
+        central.whoami = SimpleNamespace(idType="tenant", id="t")
+        with patch("central.sync_to_db.CentralSession", return_value=central):
+            sync_client_credentials_to_database(
+                db_conn, "a", "b", quiet=True, sync_mdr=True
+            )
+    assert mock_st.call_args[1]["sync_mdr"] is True
+
+
+def test_mdr_sync_request_failed(db_conn):
+    central = MagicMock()
+    with patch(
+        "central.sync_to_db.get_mdr_threat_feed",
+        return_value=ReturnState(success=False, message="fail", value=None),
+    ):
+        _sync_mdr_threat_feed_for_firewall(
+            db_conn,
+            central,
+            firewall_id="fw1",
+            tenant_id="t1",
+            url_base="https://h/",
+            client_id="c",
+            update_id="u1",
+            run_timestamp="ts",
+        )
+    row = db_conn.execute(
+        "SELECT poll_status, detail_message FROM mdr_threat_feed_sync WHERE firewall_id=?",
+        ("fw1",),
+    ).fetchone()
+    assert row["poll_status"] == "request_failed"
+
+
+def test_mdr_sync_no_transaction_id(db_conn):
+    central = MagicMock()
+    kick_val = MagicMock(success=True, data={})
+    with patch(
+        "central.sync_to_db.get_mdr_threat_feed",
+        return_value=ReturnState(success=True, value=kick_val),
+    ):
+        _sync_mdr_threat_feed_for_firewall(
+            db_conn,
+            central,
+            firewall_id="fw2",
+            tenant_id="t1",
+            url_base="https://h/",
+            client_id="c",
+            update_id="u1",
+            run_timestamp="ts",
+        )
+    row = db_conn.execute(
+        "SELECT poll_status FROM mdr_threat_feed_sync WHERE firewall_id=?",
+        ("fw2",),
+    ).fetchone()
+    assert row["poll_status"] == "no_transaction_id"
+
+
+def test_mdr_sync_finished_and_timeout(db_conn):
+    central = MagicMock()
+
+    def _kick():
+        kv = MagicMock(success=True, data={"transactionId": "tx"})
+        return ReturnState(success=True, value=kv)
+
+    tr_done = MagicMock(success=True, data={"status": "finished", "result": "success"})
+    tr_pending = MagicMock(success=True, data={"status": "pending"})
+
+    with patch("central.sync_to_db.get_mdr_threat_feed", side_effect=[_kick()]):
+        with patch(
+            "central.sync_to_db.get_firewall_transaction",
+            return_value=ReturnState(success=True, value=tr_done),
+        ):
+            _sync_mdr_threat_feed_for_firewall(
+                db_conn,
+                central,
+                firewall_id="fw3",
+                tenant_id="t1",
+                url_base="https://h/",
+                client_id="c",
+                update_id="u1",
+                run_timestamp="ts",
+                max_polls=3,
+                sleep_fn=lambda _s: None,
+            )
+    assert (
+        db_conn.execute(
+            "SELECT poll_status, transaction_result FROM mdr_threat_feed_sync WHERE firewall_id=?",
+            ("fw3",),
+        ).fetchone()["poll_status"]
+        == "finished"
+    )
+
+    with patch("central.sync_to_db.get_mdr_threat_feed", side_effect=[_kick()]):
+        with patch(
+            "central.sync_to_db.get_firewall_transaction",
+            return_value=ReturnState(success=True, value=tr_pending),
+        ):
+            _sync_mdr_threat_feed_for_firewall(
+                db_conn,
+                central,
+                firewall_id="fw4",
+                tenant_id="t1",
+                url_base="https://h/",
+                client_id="c",
+                update_id="u1",
+                run_timestamp="ts",
+                max_polls=2,
+                sleep_fn=lambda _s: None,
+            )
+    assert (
+        db_conn.execute(
+            "SELECT poll_status FROM mdr_threat_feed_sync WHERE firewall_id=?",
+            ("fw4",),
+        ).fetchone()["poll_status"]
+        == "timeout"
+    )
+
+
+def test_mdr_sync_poll_return_state_fails(db_conn):
+    central = MagicMock()
+    kick_val = MagicMock(success=True, data={"transactionId": "tx"})
+    with patch(
+        "central.sync_to_db.get_mdr_threat_feed",
+        return_value=ReturnState(success=True, value=kick_val),
+    ):
+        with patch(
+            "central.sync_to_db.get_firewall_transaction",
+            return_value=ReturnState(success=False, message="tx bad", value=None),
+        ):
+            _sync_mdr_threat_feed_for_firewall(
+                db_conn,
+                central,
+                firewall_id="fw5",
+                tenant_id="t1",
+                url_base="https://h/",
+                client_id="c",
+                update_id="u1",
+                run_timestamp="ts",
+            )
+    assert (
+        db_conn.execute(
+            "SELECT poll_status FROM mdr_threat_feed_sync WHERE firewall_id=?",
+            ("fw5",),
+        ).fetchone()["poll_status"]
+        == "poll_failed"
+    )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_groups_sync_status_and_mdr(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    grp = SimpleNamespace(id="g1", name="G1")
+    mock_grp.return_value = [grp]
+    mock_gss.return_value = [
+        FirewallSyncStatus(
+            firewall=FirewallID(id="fw1"),
+            status="inSync",
+            lastUpdatedAt="2020-01-01T00:00:00Z",
+        )
+    ]
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    fw_obj = SimpleNamespace(
+        id="fw1",
+        serialNumber="S",
+        tenant=SimpleNamespace(id="t1"),
+        group=None,
+        status=None,
+    )
+    mock_gfw.return_value = [fw_obj]
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            with patch(
+                "central.sync_to_db._sync_mdr_threat_feed_for_firewall"
+            ) as mock_mdr:
+                sync_partner(
+                    db_conn,
+                    central,
+                    client_id="oauth-cid",
+                    update_id="ug",
+                    run_timestamp="ts",
+                    progress=None,
+                    sync_mdr=True,
+                )
+                mock_mdr.assert_called_once()
+    n_g = db_conn.execute(
+        "SELECT COUNT(*) FROM firewall_groups WHERE id=?", ("g1",)
+    ).fetchone()[0]
+    n_s = db_conn.execute(
+        "SELECT COUNT(*) FROM firewall_group_sync_status WHERE group_id=? AND firewall_id=?",
+        ("g1", "fw1"),
+    ).fetchone()[0]
+    assert n_g == 1 and n_s == 1
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_groups_api_failures(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    mock_grp.return_value = ReturnState(success=False, message="nogroups")
+    mock_gss.return_value = []
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = []
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="uf",
+                run_timestamp="ts",
+                progress=None,
+            )
+    mock_grp.return_value = [SimpleNamespace(id="g2")]
+    mock_gss.return_value = ReturnState(success=False, message="nosync")
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="uf2",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_firewall_api_failure_warns(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    mock_gfw.return_value = ReturnState(success=False, message="no fw")
+    mock_grp.return_value = []
+    mock_gss.return_value = []
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="ufw",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_firmware_upgrade_check_fails(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    fw_obj = SimpleNamespace(
+        id="fw1",
+        serialNumber="S",
+        tenant=SimpleNamespace(id="t1"),
+        group=None,
+        status=None,
+    )
+    mock_gfw.return_value = [fw_obj]
+    mock_grp.return_value = []
+    mock_gss.return_value = []
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = ReturnState(success=False, message="fwup")
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="uff",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_mdr_with_progress_updates(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    mock_grp.return_value = []
+    mock_gss.return_value = []
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    fw_obj = SimpleNamespace(
+        id="fw1",
+        serialNumber="S",
+        tenant=SimpleNamespace(id="t1"),
+        group=None,
+        status=None,
+    )
+    mock_gfw.return_value = [fw_obj]
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    pr = SyncProgress()
+    pr._visible = False
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            with patch("central.sync_to_db._sync_mdr_threat_feed_for_firewall"):
+                sync_partner(
+                    db_conn,
+                    central,
+                    client_id="oauth-cid",
+                    update_id="umdr",
+                    run_timestamp="ts",
+                    progress=pr,
+                    sync_mdr=True,
+                )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_alert_detail_skips_return_state(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    mock_grp.return_value = []
+    mock_gss.return_value = []
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = []
+    mock_lic.return_value = []
+    mock_alerts.return_value = [SimpleNamespace(id="a1")]
+    mock_get_alert.return_value = ReturnState(success=False, message="d")
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=["a1"]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="uad",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_tenant_firewall_groups_api_fail(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
+    mock_gfw.return_value = []
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    mock_grp.return_value = ReturnState(success=False, message="gf")
+    mock_gss.return_value = []
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_tenant(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="utg",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_tenant_groups_sync_mdr_and_firmware_fail(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
+    mock_gfw.return_value = [
+        SimpleNamespace(
+            id="f1",
+            serialNumber="SN",
+            tenant=SimpleNamespace(id="t1"),
+            group=None,
+            status=None,
+        )
+    ]
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = ReturnState(success=False, message="badfw")
+    g = SimpleNamespace(id="tg1", name="G")
+    mock_grp.return_value = [g]
+    mock_gss.return_value = [
+        FirewallSyncStatus(
+            firewall=FirewallID(id="f1"),
+            status="syncing",
+            lastUpdatedAt="2021-01-01",
+        )
+    ]
+    pr = SyncProgress()
+    pr._visible = False
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            with patch("central.sync_to_db._sync_mdr_threat_feed_for_firewall"):
+                sync_tenant(
+                    db_conn,
+                    central,
+                    client_id="oauth-cid",
+                    update_id="utm",
+                    run_timestamp="ts",
+                    progress=pr,
+                    sync_mdr=True,
+                )
+
+
+@patch("central.sync_to_db.shutil.get_terminal_size", return_value=SimpleNamespace(columns=25))
+@patch("central.sync_to_db.sys.stdout.isatty", return_value=True)
+def test_sync_progress_no_color_ljusts_line(mock_isatty, mock_gs, monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    sp = SyncProgress()
+    sp._visible = True
+    sp.set_total(3)
+    sp.update("short", current=1)
+    sp.clear()
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_partner_group_sync_status_call_fails(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    mock_grp.return_value = [SimpleNamespace(id="gx")]
+    mock_gss.return_value = ReturnState(success=False, message="syncfail")
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = []
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_partner(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="ugs",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_firewalls")
+@patch("central.sync_to_db.get_firewall_group_sync_status")
+@patch("central.sync_to_db.get_firewall_groups")
+def test_sync_tenant_group_sync_status_call_fails(
+    mock_grp,
+    mock_gss,
+    mock_gfw,
+    mock_lic,
+    mock_alerts,
+    mock_get_alert,
+    mock_fw_up,
+    db_conn,
+):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
+    mock_gfw.return_value = []
+    mock_lic.return_value = []
+    mock_alerts.return_value = []
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    mock_grp.return_value = [SimpleNamespace(id="gy")]
+    mock_gss.return_value = ReturnState(success=False, message="nope")
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]):
+        with patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+            sync_tenant(
+                db_conn,
+                central,
+                client_id="oauth-cid",
+                update_id="utgs",
+                run_timestamp="ts",
+                progress=None,
+            )
+
+
+@patch("central.sync_to_db.sync_client_credentials_to_database")
+@patch("central.sync_to_db.get_connection")
+@patch("central.sync_to_db.init_schema")
+@patch("central.sync_to_db.configure_logging")
+@patch("central.sync_to_db._cred_sources_from_args")
+def test_main_passes_mdr_flag_to_sync(
+    mock_cred, mock_cfg, mock_init, mock_conn, mock_sync, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    mock_cred.return_value = [("a", "b")]
+    mock_conn.return_value = MagicMock()
+    mock_sync.return_value = CredentialsSyncResult(
+        "s",
+        {t: {"added": 0, "updated": 0} for t in _SUMMARY_TABLE_KEYS},
+        {},
+        0.0,
+    )
+    dbf = tmp_path / "mdr.db"
+    with patch.object(sys, "argv", ["prog", "--db", str(dbf), "--mdr"]):
+        from central.sync_to_db import main
+
+        main()
+    assert mock_sync.call_args[1]["sync_mdr"] is True

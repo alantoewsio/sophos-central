@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from typing import List, Union
 from central.session import CentralSession
 from central.classes import ReturnState
@@ -84,7 +85,7 @@ def upgrade_firmware(
     """Schedule a firmware upgrade for one or more firewalls.
 
     POST /firewall/v1/firewalls/actions/firmware-upgrade
-    Request body: one upgrade object or a list of upgrade objects.
+    Request body: ``{"firewalls": [ upgrade objects ]}`` per OpenAPI.
 
     Args:
         central: CentralSession object
@@ -104,20 +105,23 @@ def upgrade_firmware(
             message="No firmware upgrades to schedule",
         )
 
+    def _format_upgrade_at(dt: datetime) -> str:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return (
+            dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond // 1000:03d}Z"
+        )
+
     def _upgrade_to_payload(u: FirmwareUpgrade) -> dict:
         payload = {
             "id": u.id,
             "upgradeToVersion": u.upgradeToVersion,
         }
         if u.upgradeAt is not None:
-            payload["upgradeAt"] = u.upgradeAt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            payload["upgradeAt"] = _format_upgrade_at(u.upgradeAt)
         return payload
 
-    # API accepts a single upgrade object per the existing schedule_firmware_upgrade pattern
-    payload = _upgrade_to_payload(upgrades[0]) if len(upgrades) == 1 else None
-    if payload is None:
-        # Multiple upgrades: send as list under "firewalls" to mirror firmware-upgrade-check
-        payload = {"firewalls": [_upgrade_to_payload(u) for u in upgrades]}
+    payload = {"firewalls": [_upgrade_to_payload(u) for u in upgrades]}
 
     logger.info(
         "upgrade_firmware count=%s ids=%s",

@@ -79,3 +79,14 @@ class UserID:
     name: str
     accountId: str
     accountType: str
+
+
+@dataclass
+class FirewallSyncStatus:
+    firewall: FirewallID
+    status: str
+    lastUpdatedAt: str
+
+
+class FirewallSyncStatuses(CentralItems[FirewallSyncStatus]):
+    pass

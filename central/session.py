@@ -330,7 +330,9 @@ class CentralSession:
         if not self.auth and not self.authenticate():
             return ReturnState(success=False, message="Error: not authenticated")
 
-        full_url = self._get_url(url_base, url_path, params)
+        full_url = self._get_url(
+            url_path=url_path, url_base=url_base, params=params
+        )
         headers = self._add_base_headers(tenant_id=tenant_id)
 
         response = requests.patch(
@@ -376,7 +378,9 @@ class CentralSession:
     ) -> ReturnState:
         if not self.auth and not self.authenticate():
             return ReturnState(success=False, message="Error: not authenticated")
-        full_url = self._get_url(url_base, url_path, params)
+        full_url = self._get_url(
+            url_path=url_path, url_base=url_base, params=params
+        )
         headers = self._add_base_headers(
             tenant_id=tenant_id,
             partner_id=partner_id,

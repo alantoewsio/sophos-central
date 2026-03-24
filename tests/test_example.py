@@ -149,7 +149,7 @@ def test_main_auth_fails(
 @patch("example.CentralSession")
 @patch("example.get_creds")
 def test_main_tenant_branch(
-    mock_creds, mock_sess, mock_cfg, mock_gfw, mock_grp, mock_lic, mock_fw_chk
+    mock_creds, mock_sess, mock_cfg, mock_gfw, mock_grp, mock_lic, mock_fw_chk, capsys
 ):
     mock_creds.return_value = {"CENTRAL-CLIENT-ID": "a", "CENTRAL-CLIENT-SECRET": "b"}
     who = WhoamiResponse(
@@ -216,9 +216,9 @@ def test_main_tenant_branch(
     )
     mock_fw_chk.return_value = info
     with patch.object(sys, "argv", ["ex"]):
-        # example.py uses undefined `tenant` in tenant branch firmware call (line ~223)
-        with pytest.raises(UnboundLocalError):
-            example.main()
+        example.main()
+    out = capsys.readouterr().out
+    assert "Firmware upgrades" in out or "firewall groups" in out.lower()
 
 
 @patch("example.firmware_upgrade_check")
@@ -325,3 +325,38 @@ def test_main_partner_licenses_ok(
 def test_example_test_fn(capsys):
     example.test()
     assert capsys.readouterr().out
+
+
+@patch("example.firmware_upgrade_check")
+@patch("example.get_licenses")
+@patch("example.get_firewall_groups")
+@patch("example.get_firewalls")
+@patch("example.configure_logging")
+@patch("example.CentralSession")
+@patch("example.get_creds")
+def test_main_tenant_logs_groups_and_firmware_error_message(
+    mock_creds, mock_sess, mock_cfg, mock_gfw, mock_grp, mock_lic, mock_fw_chk, capsys
+):
+    mock_creds.return_value = {"CENTRAL-CLIENT-ID": "a", "CENTRAL-CLIENT-SECRET": "b"}
+    mock_sess.return_value.authenticate.return_value = SimpleNamespace(success=True)
+    mock_sess.return_value.whoami = WhoamiResponse(
+        id="t1",
+        idType="tenant",
+        apiHosts={"global": "https://g/", "dataRegion": "https://d/"},
+    )
+    fw = SimpleNamespace(
+        id="fid",
+        status=SimpleNamespace(
+            managingStatus="approved",
+            reportingStatus="approved",
+            connected=False,
+            suspended=False,
+        ),
+    )
+    mock_gfw.return_value = _SuccessList([fw])
+    mock_grp.return_value = [SimpleNamespace(name="GrpName", id="g1")]
+    mock_lic.return_value = Licenses([])
+    mock_fw_chk.return_value = SimpleNamespace(success=False, message="firmware_err")
+    with patch.object(sys, "argv", ["ex"]):
+        example.main()
+    assert "firmware_err" in capsys.readouterr().out

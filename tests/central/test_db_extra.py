@@ -36,6 +36,94 @@ def test_upsert_tenant_contact_dict_without_get(db_conn):
     )
 
 
+def test_scalar_text_isoformat_raises(db_conn):
+    class BadDate:
+        def isoformat(self):
+            raise ValueError("nope")
+
+    db.upsert_tenant(
+        db_conn,
+        {"id": "t1", "name": "T"},
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    db.upsert_firewall_group(
+        db_conn,
+        {
+            "id": "giso",
+            "name": "N",
+            "parentGroup": None,
+            "lockedByManagingAccount": False,
+            "firewalls": None,
+            "configImport": None,
+            "createdBy": None,
+            "updatedBy": None,
+            "createdAt": BadDate(),
+            "updatedAt": None,
+        },
+        tenant_id="t1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    row = db_conn.execute(
+        "SELECT created_at FROM firewall_groups WHERE id=?", ("giso",)
+    ).fetchone()
+    assert row[0] is not None
+
+
+def test_upsert_firewall_group_and_sync_status(db_conn):
+    db.upsert_tenant(
+        db_conn,
+        {"id": "t1", "name": "T"},
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    g = {
+        "id": "gg1",
+        "name": "Grp",
+        "parentGroup": {"id": "p1"},
+        "lockedByManagingAccount": True,
+        "firewalls": {"total": 1, "itemsCount": 1, "items": [{"id": "fw1"}]},
+        "configImport": None,
+        "createdBy": None,
+        "updatedBy": None,
+        "createdAt": "2020-01-01",
+        "updatedAt": None,
+    }
+    db.upsert_firewall_group(
+        db_conn,
+        g,
+        tenant_id="t1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    db.upsert_firewall_group_sync_status(
+        db_conn,
+        group_id="gg1",
+        firewall_id="fw1",
+        tenant_id="t1",
+        status="inSync",
+        last_updated_at="2020-02-02",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    assert db_conn.execute(
+        "SELECT name FROM firewall_groups WHERE id=?", ("gg1",)
+    ).fetchone()[0] == "Grp"
+    assert (
+        db_conn.execute(
+            "SELECT status FROM firewall_group_sync_status WHERE group_id=?",
+            ("gg1",),
+        ).fetchone()[0]
+        == "inSync"
+    )
+
+
 def test_upsert_license_usage_date_string(db_conn):
     from types import SimpleNamespace
 

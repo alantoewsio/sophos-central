@@ -220,7 +220,10 @@ def main():
 
         fw_ids = [fw.id for fw in firewalls]
         firmware_upgrades = firmware_upgrade_check(
-            central, fw_ids, tenant_id=tenant.id, url_base=tenant.apiHost
+            central,
+            fw_ids,
+            tenant_id=central.whoami.id,
+            url_base=central.whoami.data_region_url(),
         )
         if firmware_upgrades.success:
             print(

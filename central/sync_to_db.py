@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Companion script: sync tenants, firewalls, licenses, alerts, and firmware update info from Sophos Central to a local SQLite DB.
+Companion script: sync tenants, firewalls, firewall groups, group sync status, optional MDR threat-feed
+snapshots, licenses, alerts, and firmware update info from Sophos Central to a local SQLite DB.
 Updates existing records and inserts new ones. Uses credentials from credentials.env or .env.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -39,11 +41,19 @@ from central.db import (
     upsert_alert_detail,
     upsert_firmware_upgrade,
     upsert_firmware_version,
+    upsert_firewall_group,
+    upsert_firewall_group_sync_status,
+    upsert_mdr_threat_feed_sync,
 )
 from central.firewalls.methods import get_firewalls
 from central.firewalls.licenses import get_licenses
 from central.alerts.methods import get_alert, get_alerts
 from central.firewalls.firmware.methods import firmware_upgrade_check
+from central.firewalls.groups.methods import (
+    get_firewall_group_sync_status,
+    get_firewall_groups,
+)
+from central.firewalls.mdr.methods import get_firewall_transaction, get_mdr_threat_feed
 
 DEFAULT_LOG_LEVEL = "INFO"
 LOG_LEVEL_CHOICES = ("DEBUG", "INFO", "WARNING", "ERROR")
@@ -133,6 +143,108 @@ def _cred_sources_from_args(args) -> list[tuple[str, str]]:
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sync_mdr_threat_feed_for_firewall(
+    conn: sqlite3.Connection,
+    central: CentralSession,
+    *,
+    firewall_id: str,
+    tenant_id: str,
+    url_base: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    max_polls: int = 12,
+    sleep_fn=time.sleep,
+) -> None:
+    """Request MDR threat feed and poll the transaction until finished or max_polls."""
+    kick = get_mdr_threat_feed(
+        central,
+        firewall_id,
+        url_base=url_base,
+        tenant_id=tenant_id,
+    )
+    if not kick.success or kick.value is None:
+        upsert_mdr_threat_feed_sync(
+            conn,
+            firewall_id=firewall_id,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            poll_status="request_failed",
+            detail_message=kick.message or "get_mdr_threat_feed failed",
+        )
+        return
+    data = kick.value.data or {}
+    tx_id = data.get("transactionId")
+    if not tx_id:
+        upsert_mdr_threat_feed_sync(
+            conn,
+            firewall_id=firewall_id,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            poll_status="no_transaction_id",
+            detail_message="Response missing transactionId",
+        )
+        return
+
+    last_body: dict | None = None
+    for _ in range(max_polls):
+        tr = get_firewall_transaction(
+            central,
+            firewall_id,
+            str(tx_id),
+            url_base=url_base,
+            tenant_id=tenant_id,
+        )
+        if not tr.success or tr.value is None:
+            upsert_mdr_threat_feed_sync(
+                conn,
+                firewall_id=firewall_id,
+                tenant_id=tenant_id,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                transaction_id=str(tx_id),
+                poll_status="poll_failed",
+                detail_message=tr.message or "get_firewall_transaction failed",
+            )
+            return
+        last_body = tr.value.data or {}
+        if last_body.get("status") == "finished":
+            upsert_mdr_threat_feed_sync(
+                conn,
+                firewall_id=firewall_id,
+                tenant_id=tenant_id,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                transaction_id=str(tx_id),
+                poll_status="finished",
+                transaction_status=last_body.get("status"),
+                transaction_result=last_body.get("result"),
+                response_json=json.dumps(last_body, default=str),
+            )
+            return
+        sleep_fn(1.0)
+
+    upsert_mdr_threat_feed_sync(
+        conn,
+        firewall_id=firewall_id,
+        tenant_id=tenant_id,
+        client_id=client_id,
+        update_id=update_id,
+        run_timestamp=run_timestamp,
+        transaction_id=str(tx_id),
+        poll_status="timeout",
+        transaction_status=(last_body or {}).get("status"),
+        transaction_result=(last_body or {}).get("result"),
+        response_json=json.dumps(last_body, default=str) if last_body else None,
+    )
 
 
 def _format_duration(seconds: float) -> str:
@@ -309,6 +421,9 @@ SUMMARY_TABLES = (
     "alert_details",
     "firmware_upgrades",
     "firmware_versions",
+    "firewall_groups",
+    "firewall_group_sync_status",
+    "mdr_threat_feed_sync",
 )
 
 # Pre-built SELECT * queries per table (table names are fixed; no user input).
@@ -321,6 +436,9 @@ _SELECT_ALL_QUERIES = {
     "alert_details": "SELECT * FROM alert_details",
     "firmware_upgrades": "SELECT * FROM firmware_upgrades",
     "firmware_versions": "SELECT * FROM firmware_versions",
+    "firewall_groups": "SELECT * FROM firewall_groups",
+    "firewall_group_sync_status": "SELECT * FROM firewall_group_sync_status",
+    "mdr_threat_feed_sync": "SELECT * FROM mdr_threat_feed_sync",
 }
 
 # Excel sheet names must be <= 31 chars; our table names fit
@@ -358,6 +476,7 @@ def sync_partner(
     run_timestamp: str,
     elapsed_by_table: dict[str, float] | None = None,
     progress: SyncProgress | None = None,
+    sync_mdr: bool = False,
 ) -> None:
     """Sync all tenants and per-tenant firewalls and licenses; then partner-level licenses."""
     if elapsed_by_table is None:
@@ -369,8 +488,8 @@ def sync_partner(
     else:
         tenants = list(tenants_result)
 
-    # 6 steps per tenant + 1 partner licenses
-    total_steps = len(tenants) * 6 + 1
+    steps_per_tenant = 8 + (1 if sync_mdr else 0)
+    total_steps = len(tenants) * steps_per_tenant + 1
     if progress is not None:
         progress.set_total(total_steps)
 
@@ -396,6 +515,7 @@ def sync_partner(
         if progress is not None:
             progress.update(f"Tenant {tenant.name!r}: firewalls", step)
         t0 = time.perf_counter()
+        firewalls: list = []
         firewalls_result = get_firewalls(
             central,
             tenant_id=tenant.id,
@@ -406,7 +526,7 @@ def sync_partner(
                 "Firewalls for tenant %s: %s", tenant.id, firewalls_result.message
             )
         else:
-            firewalls = firewalls_result
+            firewalls = list(firewalls_result)
             for fw in firewalls:
                 upsert_firewall(
                     conn,
@@ -420,7 +540,7 @@ def sync_partner(
         logger.info(
             "Tenant %s: %d firewalls synced (%s)",
             tenant.name,
-            len(firewalls) if not isinstance(firewalls_result, ReturnState) else 0,
+            len(firewalls),
             _format_duration(elapsed),
         )
         step += 1
@@ -588,6 +708,118 @@ def sync_partner(
                 else 0,
                 _format_duration(elapsed),
             )
+        step += 1
+
+        if progress is not None:
+            progress.update(f"Tenant {tenant.name!r}: firewall groups", step)
+        t0 = time.perf_counter()
+        groups_result = get_firewall_groups(
+            central,
+            tenant_id=tenant.id,
+            url_base=tenant.apiHost,
+        )
+        groups_list: list = []
+        if isinstance(groups_result, ReturnState) and not groups_result.success:
+            logger.warning(
+                "Firewall groups for tenant %s: %s",
+                tenant.id,
+                groups_result.message,
+            )
+        else:
+            groups_list = list(groups_result)
+            for grp in groups_list:
+                upsert_firewall_group(
+                    conn,
+                    grp,
+                    tenant_id=tenant.id,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["firewall_groups"] = (
+            elapsed_by_table.get("firewall_groups", 0) + elapsed
+        )
+        logger.info(
+            "Tenant %s: %d firewall groups synced (%s)",
+            tenant.name,
+            len(groups_list),
+            _format_duration(elapsed),
+        )
+        step += 1
+
+        if progress is not None:
+            progress.update(
+                f"Tenant {tenant.name!r}: firewall group sync status", step
+            )
+        t0 = time.perf_counter()
+        n_sync_rows = 0
+        for grp in groups_list:
+            sync_res = get_firewall_group_sync_status(
+                central,
+                grp.id,
+                tenant_id=tenant.id,
+                url_base=tenant.apiHost,
+            )
+            if isinstance(sync_res, ReturnState) and not sync_res.success:
+                logger.warning(
+                    "Group sync status %s / %s: %s",
+                    tenant.id,
+                    grp.id,
+                    sync_res.message,
+                )
+                continue
+            for row in sync_res:
+                upsert_firewall_group_sync_status(
+                    conn,
+                    group_id=grp.id,
+                    firewall_id=row.firewall.id,
+                    tenant_id=tenant.id,
+                    status=row.status,
+                    last_updated_at=row.lastUpdatedAt,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+                n_sync_rows += 1
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["firewall_group_sync_status"] = (
+            elapsed_by_table.get("firewall_group_sync_status", 0) + elapsed
+        )
+        logger.info(
+            "Tenant %s: %d group sync status rows (%s)",
+            tenant.name,
+            n_sync_rows,
+            _format_duration(elapsed),
+        )
+        step += 1
+
+        if sync_mdr and firewalls:
+            if progress is not None:
+                progress.update(f"Tenant {tenant.name!r}: MDR threat feed", step)
+            t0 = time.perf_counter()
+            for fw in firewalls:
+                _sync_mdr_threat_feed_for_firewall(
+                    conn,
+                    central,
+                    firewall_id=fw.id,
+                    tenant_id=tenant.id,
+                    url_base=tenant.apiHost,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+            elapsed = time.perf_counter() - t0
+            elapsed_by_table["mdr_threat_feed_sync"] = (
+                elapsed_by_table.get("mdr_threat_feed_sync", 0) + elapsed
+            )
+            logger.info(
+                "Tenant %s: MDR threat feed polled for %d firewalls (%s)",
+                tenant.name,
+                len(firewalls),
+                _format_duration(elapsed),
+            )
+            step += 1
 
     if progress is not None:
         progress.update("Partner-level licenses", step)
@@ -632,12 +864,13 @@ def sync_tenant(
     run_timestamp: str,
     elapsed_by_table: dict[str, float] | None = None,
     progress: SyncProgress | None = None,
+    sync_mdr: bool = False,
 ) -> None:
-    """Sync current tenant context: one tenant row, firewalls, licenses."""
+    """Sync current tenant context: one tenant row, firewalls, licenses, groups, optional MDR."""
     if elapsed_by_table is None:
         elapsed_by_table = {}
     if progress is not None:
-        progress.set_total(6)
+        progress.set_total(8 + (1 if sync_mdr else 0))
     whoami = central.whoami
     url_base = whoami.data_region_url()
     if progress is not None:
@@ -820,6 +1053,102 @@ def sync_tenant(
             _format_duration(elapsed),
         )
 
+    if progress is not None:
+        progress.update("Firewall groups", 6)
+    t0 = time.perf_counter()
+    groups_result = get_firewall_groups(
+        central,
+        tenant_id=whoami.id,
+        url_base=url_base,
+    )
+    groups_list: list = []
+    if isinstance(groups_result, ReturnState) and not groups_result.success:
+        logger.warning("Firewall groups: %s", groups_result.message)
+    else:
+        groups_list = list(groups_result)
+        for grp in groups_list:
+            upsert_firewall_group(
+                conn,
+                grp,
+                tenant_id=whoami.id,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+    elapsed = time.perf_counter() - t0
+    elapsed_by_table["firewall_groups"] = (
+        elapsed_by_table.get("firewall_groups", 0) + elapsed
+    )
+    logger.info(
+        "Firewall groups synced: %d (%s)",
+        len(groups_list),
+        _format_duration(elapsed),
+    )
+
+    if progress is not None:
+        progress.update("Firewall group sync status", 7)
+    t0 = time.perf_counter()
+    n_sync_rows = 0
+    for grp in groups_list:
+        sync_res = get_firewall_group_sync_status(
+            central,
+            grp.id,
+            tenant_id=whoami.id,
+            url_base=url_base,
+        )
+        if isinstance(sync_res, ReturnState) and not sync_res.success:
+            logger.warning(
+                "Group sync status for %s: %s", grp.id, sync_res.message
+            )
+            continue
+        for row in sync_res:
+            upsert_firewall_group_sync_status(
+                conn,
+                group_id=grp.id,
+                firewall_id=row.firewall.id,
+                tenant_id=whoami.id,
+                status=row.status,
+                last_updated_at=row.lastUpdatedAt,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+            n_sync_rows += 1
+    elapsed = time.perf_counter() - t0
+    elapsed_by_table["firewall_group_sync_status"] = (
+        elapsed_by_table.get("firewall_group_sync_status", 0) + elapsed
+    )
+    logger.info(
+        "Group sync status rows: %d (%s)",
+        n_sync_rows,
+        _format_duration(elapsed),
+    )
+
+    if sync_mdr and firewalls_list:
+        if progress is not None:
+            progress.update("MDR threat feed", 8)
+        t0 = time.perf_counter()
+        for fw in firewalls_list:
+            _sync_mdr_threat_feed_for_firewall(
+                conn,
+                central,
+                firewall_id=fw.id,
+                tenant_id=whoami.id,
+                url_base=url_base,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["mdr_threat_feed_sync"] = (
+            elapsed_by_table.get("mdr_threat_feed_sync", 0) + elapsed
+        )
+        logger.info(
+            "MDR threat feed polled for %d firewalls (%s)",
+            len(firewalls_list),
+            _format_duration(elapsed),
+        )
+
 
 @contextmanager
 def _quiet_sync_cli_loggers(quiet: bool):
@@ -848,6 +1177,7 @@ def sync_client_credentials_to_database(
     *,
     quiet: bool = True,
     progress: SyncProgress | None = None,
+    sync_mdr: bool = False,
 ) -> CredentialsSyncResult:
     """
     Sync one Sophos Central API credential (partner or tenant) into an open SQLite connection.
@@ -893,6 +1223,7 @@ def sync_client_credentials_to_database(
                 run_timestamp=run_timestamp,
                 elapsed_by_table=elapsed_by_table,
                 progress=use_progress,
+                sync_mdr=sync_mdr,
             )
         else:
             sync_tenant(
@@ -903,6 +1234,7 @@ def sync_client_credentials_to_database(
                 run_timestamp=run_timestamp,
                 elapsed_by_table=elapsed_by_table,
                 progress=use_progress,
+                sync_mdr=sync_mdr,
             )
 
         total_elapsed = time.perf_counter() - sync_start
@@ -920,7 +1252,7 @@ def sync_client_credentials_to_database(
 def parse_args():
     p = argparse.ArgumentParser(
         prog="central-sync-to-db",
-        description="Sync Sophos Central tenants, firewalls, licenses, alerts, and firmware info to SQLite",
+        description="Sync Sophos Central tenants, firewalls, groups, licenses, alerts, and firmware info to SQLite",
     )
     p.add_argument(
         "-l",
@@ -971,6 +1303,14 @@ def parse_args():
         const="",  # trigger when flag present with no path
         help="Export all DB tables to an xlsx workbook (one sheet per table). Optional path (default: <db-stem>.xlsx beside the DB).",
     )
+    p.add_argument(
+        "--mdr",
+        action="store_true",
+        help=(
+            "After firewall groups, request MDR threat feed per firewall and poll transactions "
+            "(slow; can add minutes per firewall)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1007,6 +1347,7 @@ def main() -> None:
                     client_secret,
                     quiet=False,
                     progress=progress,
+                    sync_mdr=args.mdr,
                 )
             except CentralSyncAuthError as e:
                 logger.error("Authentication failed: %s", e.message)

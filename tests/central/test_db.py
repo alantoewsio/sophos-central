@@ -91,7 +91,10 @@ def test_get_new_alert_ids_and_run_summary_and_latest_raised(db_conn):
     )
     db_conn.commit()
     assert db.get_new_alert_ids(db_conn, sync_id, tid) == ["a1"]
-    assert "alerts" in db.get_run_summary(db_conn, sync_id)
+    summary = db.get_run_summary(db_conn, sync_id)
+    assert "alerts" in summary
+    assert "firewall_groups" in summary
+    assert "mdr_threat_feed_sync" in summary
     assert db.get_latest_alert_raised_at(db_conn, tid) == "2024-01-01T00:00:00Z"
     assert db.get_latest_alert_raised_at(db_conn, "none") is None
 
@@ -113,6 +116,15 @@ def test_migrate_sync_columns(tmp_path: Path):
     assert "first_sync" in cols
     assert "last_sync" in cols
     assert "sync_id" in cols
+    c.close()
+
+
+def test_ensure_client_id_skips_when_table_missing(tmp_path: Path):
+    p = tmp_path / "cid.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE tenants (id TEXT PRIMARY KEY)")
+    c.commit()
+    db._ensure_client_id_column(c)
     c.close()
 
 

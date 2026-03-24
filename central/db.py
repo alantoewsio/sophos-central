@@ -70,6 +70,9 @@ _RUN_SUMMARY_TABLES = (
     "alert_details",
     "firmware_upgrades",
     "firmware_versions",
+    "firewall_groups",
+    "firewall_group_sync_status",
+    "mdr_threat_feed_sync",
 )
 _RUN_SUMMARY_QUERIES = {
     "tenants": (
@@ -103,6 +106,18 @@ _RUN_SUMMARY_QUERIES = {
     "firmware_versions": (
         "SELECT COUNT(*) FROM firmware_versions WHERE sync_id = ? AND first_sync = last_sync",
         "SELECT COUNT(*) FROM firmware_versions WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "firewall_groups": (
+        "SELECT COUNT(*) FROM firewall_groups WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM firewall_groups WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "firewall_group_sync_status": (
+        "SELECT COUNT(*) FROM firewall_group_sync_status WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM firewall_group_sync_status WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "mdr_threat_feed_sync": (
+        "SELECT COUNT(*) FROM mdr_threat_feed_sync WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM mdr_threat_feed_sync WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
     ),
 }
 
@@ -302,6 +317,60 @@ def init_schema(conn: sqlite3.Connection) -> None:
             sync_id TEXT,
             client_id TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS firewall_groups (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT,
+            parent_group_id TEXT,
+            locked_by_managing_account INTEGER NOT NULL DEFAULT 0,
+            firewalls_total INTEGER,
+            firewalls_items_count INTEGER,
+            firewalls_items_json TEXT,
+            config_import_json TEXT,
+            created_by_json TEXT,
+            updated_by_json TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            client_id TEXT,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_firewall_groups_tenant_id ON firewall_groups(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS firewall_group_sync_status (
+            group_id TEXT NOT NULL,
+            firewall_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            status TEXT,
+            last_updated_at TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            client_id TEXT,
+            PRIMARY KEY (group_id, firewall_id),
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_fgss_tenant_id ON firewall_group_sync_status(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS mdr_threat_feed_sync (
+            firewall_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            transaction_id TEXT,
+            poll_status TEXT,
+            transaction_status TEXT,
+            transaction_result TEXT,
+            response_json TEXT,
+            detail_message TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            client_id TEXT,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_mdr_threat_feed_tenant_id ON mdr_threat_feed_sync(tenant_id);
     """)
     _migrate_sync_columns(conn)
     _ensure_sync_columns(conn)
@@ -327,6 +396,9 @@ def _migrate_sync_columns(conn: sqlite3.Connection) -> None:
         "alert_details",
         "firmware_upgrades",
         "firmware_versions",
+        "firewall_groups",
+        "firewall_group_sync_status",
+        "mdr_threat_feed_sync",
     ):
         cur = conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
@@ -346,6 +418,9 @@ def _drop_synced_at_column(conn: sqlite3.Connection) -> None:
         "alert_details",
         "firmware_upgrades",
         "firmware_versions",
+        "firewall_groups",
+        "firewall_group_sync_status",
+        "mdr_threat_feed_sync",
     ):
         cur = conn.execute(f"PRAGMA table_info({table})")
         if any(row[1] == "synced_at" for row in cur.fetchall()):
@@ -365,7 +440,12 @@ def _ensure_sync_columns(conn: sqlite3.Connection) -> None:
         "alert_details",
         "firmware_upgrades",
         "firmware_versions",
+        "firewall_groups",
+        "firewall_group_sync_status",
+        "mdr_threat_feed_sync",
     ):
+        if not _table_exists(conn, table):
+            continue
         cur = conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
         for col_spec in columns:
@@ -386,12 +466,25 @@ def _ensure_client_id_column(conn: sqlite3.Connection) -> None:
         "alert_details",
         "firmware_upgrades",
         "firmware_versions",
+        "firewall_groups",
+        "firewall_group_sync_status",
+        "mdr_threat_feed_sync",
     ):
+        if not _table_exists(conn, table):
+            continue
         cur = conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
         if "client_id" not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN client_id TEXT")
             logger.debug("Added column client_id to %s", table)
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
 
 
 def _now_utc() -> str:
@@ -866,4 +959,175 @@ def upsert_firmware_version(
             client_id = excluded.client_id
         """,
         row,
+    )
+
+
+def _scalar_text(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if hasattr(val, "isoformat"):
+        try:
+            return val.isoformat()
+        except Exception:
+            return str(val)
+    return str(val)
+
+
+def upsert_firewall_group(
+    conn: sqlite3.Connection,
+    group: Any,
+    *,
+    tenant_id: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Persist a firewall group from ``get_firewall_groups`` (object or dict-like)."""
+    gid = _get(group, "id") or "unknown"
+    parent = _get(group, "parentGroup")
+    parent_id = _get(parent, "id") if parent else None
+    fws = _get(group, "firewalls")
+    total = _get(fws, "total") if fws is not None else None
+    items_count = _get(fws, "itemsCount") if fws is not None else None
+    items = _get(fws, "items") if fws is not None else None
+
+    row = (
+        gid,
+        tenant_id,
+        _get(group, "name"),
+        parent_id,
+        1 if _get(group, "lockedByManagingAccount") else 0,
+        total,
+        items_count,
+        _to_json(items),
+        _to_json(_get(group, "configImport")),
+        _to_json(_get(group, "createdBy")),
+        _to_json(_get(group, "updatedBy")),
+        _scalar_text(_get(group, "createdAt")),
+        _scalar_text(_get(group, "updatedAt")),
+        run_timestamp,
+        run_timestamp,
+        update_id,
+        client_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO firewall_groups (
+            id, tenant_id, name, parent_group_id, locked_by_managing_account,
+            firewalls_total, firewalls_items_count, firewalls_items_json,
+            config_import_json, created_by_json, updated_by_json,
+            created_at, updated_at,
+            first_sync, last_sync, sync_id, client_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            name = excluded.name,
+            parent_group_id = excluded.parent_group_id,
+            locked_by_managing_account = excluded.locked_by_managing_account,
+            firewalls_total = excluded.firewalls_total,
+            firewalls_items_count = excluded.firewalls_items_count,
+            firewalls_items_json = excluded.firewalls_items_json,
+            config_import_json = excluded.config_import_json,
+            created_by_json = excluded.created_by_json,
+            updated_by_json = excluded.updated_by_json,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
+        """,
+        row,
+    )
+
+
+def upsert_firewall_group_sync_status(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    firewall_id: str,
+    tenant_id: str,
+    status: Optional[str],
+    last_updated_at: Optional[str],
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """One row per (group, firewall) from ``get_firewall_group_sync_status``."""
+    conn.execute(
+        """
+        INSERT INTO firewall_group_sync_status (
+            group_id, firewall_id, tenant_id, status, last_updated_at,
+            first_sync, last_sync, sync_id, client_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id, firewall_id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            status = excluded.status,
+            last_updated_at = excluded.last_updated_at,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
+        """,
+        (
+            group_id,
+            firewall_id,
+            tenant_id,
+            status,
+            last_updated_at,
+            run_timestamp,
+            run_timestamp,
+            update_id,
+            client_id,
+        ),
+    )
+
+
+def upsert_mdr_threat_feed_sync(
+    conn: sqlite3.Connection,
+    *,
+    firewall_id: str,
+    tenant_id: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    transaction_id: Optional[str] = None,
+    poll_status: Optional[str] = None,
+    transaction_status: Optional[str] = None,
+    transaction_result: Optional[str] = None,
+    response_json: Optional[str] = None,
+    detail_message: Optional[str] = None,
+) -> None:
+    """Latest MDR threat-feed fetch + transaction poll outcome per firewall."""
+    conn.execute(
+        """
+        INSERT INTO mdr_threat_feed_sync (
+            firewall_id, tenant_id, transaction_id, poll_status,
+            transaction_status, transaction_result, response_json, detail_message,
+            first_sync, last_sync, sync_id, client_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(firewall_id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            transaction_id = excluded.transaction_id,
+            poll_status = excluded.poll_status,
+            transaction_status = excluded.transaction_status,
+            transaction_result = excluded.transaction_result,
+            response_json = excluded.response_json,
+            detail_message = excluded.detail_message,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
+        """,
+        (
+            firewall_id,
+            tenant_id,
+            transaction_id,
+            poll_status,
+            transaction_status,
+            transaction_result,
+            response_json,
+            detail_message,
+            run_timestamp,
+            run_timestamp,
+            update_id,
+            client_id,
+        ),
     )
