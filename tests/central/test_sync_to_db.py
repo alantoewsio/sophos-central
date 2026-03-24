@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import sys
 from pathlib import Path
@@ -1076,6 +1077,11 @@ def test_sync_partner_groups_sync_status_and_mdr(
         ("g1", "fw1"),
     ).fetchone()[0]
     assert n_g == 1 and n_s == 1
+    raw = db_conn.execute(
+        "SELECT firewalls_items_json FROM firewall_groups WHERE id=?",
+        ("g1",),
+    ).fetchone()[0]
+    assert json.loads(raw) == [{"id": "fw1"}]
 
 
 @patch("central.sync_to_db.firmware_upgrade_check")

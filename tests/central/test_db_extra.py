@@ -1,5 +1,7 @@
 """Additional central.db coverage."""
 
+import json
+
 import central.db as db
 
 
@@ -122,6 +124,52 @@ def test_upsert_firewall_group_and_sync_status(db_conn):
         ).fetchone()[0]
         == "inSync"
     )
+
+
+def test_update_firewall_group_items_json_from_sync(db_conn):
+    db.upsert_tenant(
+        db_conn,
+        {"id": "t1", "name": "T"},
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    db.upsert_firewall_group(
+        db_conn,
+        {
+            "id": "gx",
+            "name": "G",
+            "parentGroup": None,
+            "lockedByManagingAccount": False,
+            "firewalls": {"total": 2, "itemsCount": 2},
+            "configImport": None,
+            "createdBy": None,
+            "updatedBy": None,
+            "createdAt": "2020-01-01",
+            "updatedAt": None,
+        },
+        tenant_id="t1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="r",
+    )
+    assert (
+        db_conn.execute(
+            "SELECT firewalls_items_json FROM firewall_groups WHERE id=?",
+            ("gx",),
+        ).fetchone()[0]
+        is None
+    )
+    db.update_firewall_group_items_json_from_sync(
+        db_conn, "gx", [{"id": "a"}, {"id": "b"}]
+    )
+    row = db_conn.execute(
+        "SELECT firewalls_items_json, firewalls_items_count, firewalls_total "
+        "FROM firewall_groups WHERE id=?",
+        ("gx",),
+    ).fetchone()
+    assert json.loads(row[0]) == [{"id": "a"}, {"id": "b"}]
+    assert row[1] == 2 and row[2] == 2
 
 
 def test_upsert_license_usage_date_string(db_conn):

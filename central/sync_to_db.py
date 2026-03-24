@@ -42,6 +42,7 @@ from central.db import (
     upsert_firmware_upgrade,
     upsert_firmware_version,
     upsert_firewall_group,
+    update_firewall_group_items_json_from_sync,
     upsert_firewall_group_sync_status,
     upsert_mdr_threat_feed_sync,
 )
@@ -769,7 +770,9 @@ def sync_partner(
                     sync_res.message,
                 )
                 continue
+            items_payload: list[dict[str, str]] = []
             for row in sync_res:
+                items_payload.append({"id": row.firewall.id})
                 upsert_firewall_group_sync_status(
                     conn,
                     group_id=grp.id,
@@ -782,6 +785,7 @@ def sync_partner(
                     run_timestamp=run_timestamp,
                 )
                 n_sync_rows += 1
+            update_firewall_group_items_json_from_sync(conn, grp.id, items_payload)
         elapsed = time.perf_counter() - t0
         elapsed_by_table["firewall_group_sync_status"] = (
             elapsed_by_table.get("firewall_group_sync_status", 0) + elapsed
@@ -1101,7 +1105,9 @@ def sync_tenant(
                 "Group sync status for %s: %s", grp.id, sync_res.message
             )
             continue
+        items_payload: list[dict[str, str]] = []
         for row in sync_res:
+            items_payload.append({"id": row.firewall.id})
             upsert_firewall_group_sync_status(
                 conn,
                 group_id=grp.id,
@@ -1114,6 +1120,7 @@ def sync_tenant(
                 run_timestamp=run_timestamp,
             )
             n_sync_rows += 1
+        update_firewall_group_items_json_from_sync(conn, grp.id, items_payload)
     elapsed = time.perf_counter() - t0
     elapsed_by_table["firewall_group_sync_status"] = (
         elapsed_by_table.get("firewall_group_sync_status", 0) + elapsed

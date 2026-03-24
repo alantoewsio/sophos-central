@@ -33,10 +33,10 @@ def _to_json(obj: Any) -> Optional[str]:
 
 def _get(obj: Any, attr: str, default: Any = None) -> Any:
     """Get attribute from an object or key from a dict."""
+    if isinstance(obj, dict):
+        return obj[attr] if attr in obj else default
     if hasattr(obj, attr):
         return getattr(obj, attr)
-    if isinstance(obj, dict) and attr in obj:
-        return obj[attr]
     return default
 
 
@@ -1037,6 +1037,26 @@ def upsert_firewall_group(
             client_id = excluded.client_id
         """,
         row,
+    )
+
+
+def update_firewall_group_items_json_from_sync(
+    conn: sqlite3.Connection,
+    group_id: str,
+    items: list[Any],
+) -> None:
+    """Set ``firewalls_items_json`` and counts from sync-status membership (API list may omit ``firewalls.items``)."""
+    n = len(items)
+    payload = json.dumps(items)
+    conn.execute(
+        """
+        UPDATE firewall_groups SET
+            firewalls_items_json = ?,
+            firewalls_items_count = ?,
+            firewalls_total = ?
+        WHERE id = ?
+        """,
+        (payload, n, n, group_id),
     )
 
 
