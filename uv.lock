@@ -625,7 +625,7 @@ wheels = [
 
 [[package]]
 name = "sfos-central-sdk"
-version = "0.9.1"
+version = "0.9.4"
 source = { editable = "." }
 dependencies = [
     { name = "dotenv" },

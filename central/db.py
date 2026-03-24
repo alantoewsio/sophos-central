@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+SYNC_META_COLUMNS = frozenset({"first_sync", "last_sync", "sync_id", "client_id"})
+
+# (sync_id, client_id, run_timestamp) when set by :func:`sync_change_logging`.
+_sync_change_ctx: contextvars.ContextVar[Optional[tuple[str, str, str]]] = (
+    contextvars.ContextVar("sync_change_ctx", default=None)
+)
+
+
+@contextmanager
+def sync_change_logging(sync_id: str, client_id: str, run_timestamp: str):
+    """Enable per-row change logging into ``sync_change_events`` for this sync run."""
+    token = _sync_change_ctx.set((sync_id, client_id, run_timestamp))
+    try:
+        yield
+    finally:
+        _sync_change_ctx.reset(token)
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +390,21 @@ def init_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (tenant_id) REFERENCES tenants(id)
         );
         CREATE INDEX IF NOT EXISTS ix_mdr_threat_feed_tenant_id ON mdr_threat_feed_sync(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS sync_change_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sync_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            row_key_json TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            column_name TEXT,
+            old_value TEXT,
+            new_value TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_sync_change_events_sync_id ON sync_change_events(sync_id);
+        CREATE INDEX IF NOT EXISTS ix_sync_change_events_client_id ON sync_change_events(client_id);
     """)
     _migrate_sync_columns(conn)
     _ensure_sync_columns(conn)
@@ -487,6 +521,532 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _insert_sync_change_event(
+    conn: sqlite3.Connection,
+    *,
+    sync_id: str,
+    client_id: str,
+    occurred_at: str,
+    table_name: str,
+    row_key_json: str,
+    operation: str,
+    column_name: Optional[str],
+    old_value: Optional[str],
+    new_value: Optional[str],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO sync_change_events (
+            sync_id, client_id, occurred_at, table_name, row_key_json,
+            operation, column_name, old_value, new_value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            sync_id,
+            client_id,
+            occurred_at,
+            table_name,
+            row_key_json,
+            operation,
+            column_name,
+            old_value,
+            new_value,
+        ),
+    )
+
+
+def _serialize_cell(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, (bytes, memoryview)):
+        return bytes(val).decode("utf-8", errors="replace")
+    return str(val)
+
+
+def _cells_differ(a: Any, b: Any) -> bool:
+    return _serialize_cell(a) != _serialize_cell(b)
+
+
+def log_data_row_changes(
+    conn: sqlite3.Connection,
+    table: str,
+    row_key: dict[str, Any],
+    old: Optional[sqlite3.Row],
+    new: Optional[sqlite3.Row],
+) -> None:
+    """Log insert (old is None), delete (new is None), or column updates between two rows."""
+    ctx = _sync_change_ctx.get()
+    if not ctx:
+        return
+    sync_id, client_id, ts = ctx
+    rk = json.dumps(row_key, sort_keys=True, default=str)
+    old_d = dict(old) if old else {}
+    new_d = dict(new) if new else {}
+    cols = sorted((set(old_d) | set(new_d)) - SYNC_META_COLUMNS)
+    if old is None and new is None:
+        return
+    if old is None:
+        payload = {c: new_d.get(c) for c in cols}
+        _insert_sync_change_event(
+            conn,
+            sync_id=sync_id,
+            client_id=client_id,
+            occurred_at=ts,
+            table_name=table,
+            row_key_json=rk,
+            operation="insert",
+            column_name=None,
+            old_value=None,
+            new_value=json.dumps(payload, default=str),
+        )
+        return
+    if new is None:
+        payload = {c: old_d.get(c) for c in cols}
+        _insert_sync_change_event(
+            conn,
+            sync_id=sync_id,
+            client_id=client_id,
+            occurred_at=ts,
+            table_name=table,
+            row_key_json=rk,
+            operation="delete",
+            column_name=None,
+            old_value=json.dumps(payload, default=str),
+            new_value=None,
+        )
+        return
+    for c in cols:
+        if _cells_differ(old_d.get(c), new_d.get(c)):
+            _insert_sync_change_event(
+                conn,
+                sync_id=sync_id,
+                client_id=client_id,
+                occurred_at=ts,
+                table_name=table,
+                row_key_json=rk,
+                operation="update",
+                column_name=c,
+                old_value=_serialize_cell(old_d.get(c)),
+                new_value=_serialize_cell(new_d.get(c)),
+            )
+
+
+def _delete_rows_with_change_log(
+    conn: sqlite3.Connection,
+    table: str,
+    sql_select: str,
+    sql_delete: str,
+    params: tuple[Any, ...],
+    row_key_fn: Any,
+) -> int:
+    """Select rows matching sql_select, log delete for each, then run sql_delete with same params."""
+    rows = list(conn.execute(sql_select, params))
+    if not rows:
+        return 0
+    ctx = _sync_change_ctx.get()
+    for r in rows:
+        if ctx:
+            log_data_row_changes(conn, table, row_key_fn(r), r, None)
+    conn.execute(sql_delete, params)
+    return len(rows)
+
+
+def delete_stale_firewalls_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    if not keep_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "firewalls",
+            "SELECT * FROM firewalls WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM firewalls WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"id": r["id"]},
+        )
+        return
+    placeholders = ",".join("?" * len(keep_ids))
+    params = (client_id, tenant_id, *tuple(keep_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "firewalls",
+        f"SELECT * FROM firewalls WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({placeholders})",
+        f"DELETE FROM firewalls WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({placeholders})",
+        params,
+        lambda r: {"id": r["id"]},
+    )
+
+
+def delete_stale_licenses_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_serials: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    cur = conn.execute(
+        "SELECT serial_number FROM licenses WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+    )
+    stale = [r[0] for r in cur.fetchall() if r[0] not in keep_serials]
+    for serial in stale:
+        _delete_rows_with_change_log(
+            conn,
+            "license_subscriptions",
+            "SELECT * FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"id": r["id"]},
+        )
+        _delete_rows_with_change_log(
+            conn,
+            "licenses",
+            "SELECT * FROM licenses WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM licenses WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"serial_number": r["serial_number"]},
+        )
+
+
+def delete_stale_partner_licenses(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    partner_id: str,
+    keep_serials: set[str],
+    api_ok: bool,
+) -> None:
+    """Remove partner-scoped license rows (``tenant_id`` IS NULL) not returned by partner API."""
+    if not api_ok:
+        return
+    cur = conn.execute(
+        """
+        SELECT serial_number FROM licenses
+        WHERE client_id = ? AND partner_id = ? AND tenant_id IS NULL
+        """,
+        (client_id, partner_id),
+    )
+    stale = [r[0] for r in cur.fetchall() if r[0] not in keep_serials]
+    for serial in stale:
+        _delete_rows_with_change_log(
+            conn,
+            "license_subscriptions",
+            "SELECT * FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"id": r["id"]},
+        )
+        _delete_rows_with_change_log(
+            conn,
+            "licenses",
+            "SELECT * FROM licenses WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM licenses WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"serial_number": r["serial_number"]},
+        )
+
+
+def delete_stale_firmware_upgrades_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_firewall_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    if not keep_firewall_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "firmware_upgrades",
+            "SELECT * FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"firewall_id": r["firewall_id"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_firewall_ids))
+    params = (client_id, tenant_id, *tuple(keep_firewall_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "firmware_upgrades",
+        f"SELECT * FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ? AND firewall_id NOT IN ({ph})",
+        f"DELETE FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ? AND firewall_id NOT IN ({ph})",
+        params,
+        lambda r: {"firewall_id": r["firewall_id"]},
+    )
+
+
+def delete_stale_firmware_versions_for_client(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    keep_versions: set[str],
+    prune: bool,
+) -> None:
+    """Drop firmware version rows for this client when a successful firmware check ran this sync."""
+    if not prune:
+        return
+    if not keep_versions:
+        _delete_rows_with_change_log(
+            conn,
+            "firmware_versions",
+            "SELECT * FROM firmware_versions WHERE client_id = ?",
+            "DELETE FROM firmware_versions WHERE client_id = ?",
+            (client_id,),
+            lambda r: {"version": r["version"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_versions))
+    params = (client_id, *tuple(keep_versions))
+    _delete_rows_with_change_log(
+        conn,
+        "firmware_versions",
+        f"SELECT * FROM firmware_versions WHERE client_id = ? AND version NOT IN ({ph})",
+        f"DELETE FROM firmware_versions WHERE client_id = ? AND version NOT IN ({ph})",
+        params,
+        lambda r: {"version": r["version"]},
+    )
+
+
+def delete_stale_firewall_groups_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    if not keep_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "firewall_groups",
+            "SELECT * FROM firewall_groups WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM firewall_groups WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"id": r["id"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_ids))
+    params = (client_id, tenant_id, *tuple(keep_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "firewall_groups",
+        f"SELECT * FROM firewall_groups WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        f"DELETE FROM firewall_groups WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        params,
+        lambda r: {"id": r["id"]},
+    )
+
+
+def delete_stale_firewall_group_sync_status_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_pairs: set[tuple[str, str]],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    cur = conn.execute(
+        "SELECT group_id, firewall_id FROM firewall_group_sync_status WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+    )
+    for gid, fid in cur.fetchall():
+        if (gid, fid) not in keep_pairs:
+            _delete_rows_with_change_log(
+                conn,
+                "firewall_group_sync_status",
+                "SELECT * FROM firewall_group_sync_status WHERE client_id = ? AND group_id = ? AND firewall_id = ?",
+                "DELETE FROM firewall_group_sync_status WHERE client_id = ? AND group_id = ? AND firewall_id = ?",
+                (client_id, gid, fid),
+                lambda r: {"group_id": r["group_id"], "firewall_id": r["firewall_id"]},
+            )
+
+
+def delete_stale_mdr_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_firewall_ids: set[str],
+    sync_mdr: bool,
+    api_ok: bool,
+) -> None:
+    if not sync_mdr or not api_ok:
+        return
+    if not keep_firewall_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "mdr_threat_feed_sync",
+            "SELECT * FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"firewall_id": r["firewall_id"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_firewall_ids))
+    params = (client_id, tenant_id, *tuple(keep_firewall_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "mdr_threat_feed_sync",
+        f"SELECT * FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ? AND firewall_id NOT IN ({ph})",
+        f"DELETE FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ? AND firewall_id NOT IN ({ph})",
+        params,
+        lambda r: {"firewall_id": r["firewall_id"]},
+    )
+
+
+def cascade_delete_tenant_for_client(
+    conn: sqlite3.Connection, tenant_id: str, client_id: str
+) -> None:
+    """Remove all synced data for a tenant row and the tenant itself (orphan from tenant list)."""
+    _delete_rows_with_change_log(
+        conn,
+        "firewall_group_sync_status",
+        "SELECT * FROM firewall_group_sync_status WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM firewall_group_sync_status WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"group_id": r["group_id"], "firewall_id": r["firewall_id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "firmware_upgrades",
+        "SELECT * FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM firmware_upgrades WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"firewall_id": r["firewall_id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "mdr_threat_feed_sync",
+        "SELECT * FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM mdr_threat_feed_sync WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"firewall_id": r["firewall_id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "firewalls",
+        "SELECT * FROM firewalls WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM firewalls WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"id": r["id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "firewall_groups",
+        "SELECT * FROM firewall_groups WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM firewall_groups WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"id": r["id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "alert_details",
+        "SELECT * FROM alert_details WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM alert_details WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"id": r["id"]},
+    )
+    _delete_rows_with_change_log(
+        conn,
+        "alerts",
+        "SELECT * FROM alerts WHERE client_id = ? AND tenant_id = ?",
+        "DELETE FROM alerts WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+        lambda r: {"id": r["id"]},
+    )
+    cur = conn.execute(
+        "SELECT serial_number FROM licenses WHERE client_id = ? AND tenant_id = ?",
+        (client_id, tenant_id),
+    )
+    for (serial,) in cur.fetchall():
+        _delete_rows_with_change_log(
+            conn,
+            "license_subscriptions",
+            "SELECT * FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM license_subscriptions WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"id": r["id"]},
+        )
+        _delete_rows_with_change_log(
+            conn,
+            "licenses",
+            "SELECT * FROM licenses WHERE client_id = ? AND serial_number = ?",
+            "DELETE FROM licenses WHERE client_id = ? AND serial_number = ?",
+            (client_id, serial),
+            lambda r: {"serial_number": r["serial_number"]},
+        )
+    _delete_rows_with_change_log(
+        conn,
+        "tenants",
+        "SELECT * FROM tenants WHERE client_id = ? AND id = ?",
+        "DELETE FROM tenants WHERE client_id = ? AND id = ?",
+        (client_id, tenant_id),
+        lambda r: {"id": r["id"]},
+    )
+
+
+def delete_stale_tenants_for_partner(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    keep_tenant_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    cur = conn.execute(
+        "SELECT id FROM tenants WHERE client_id = ?",
+        (client_id,),
+    )
+    stale = [r[0] for r in cur.fetchall() if r[0] not in keep_tenant_ids]
+    for tid in stale:
+        cascade_delete_tenant_for_client(conn, tid, client_id)
+
+
+def delete_stale_license_subscriptions_for_serial(
+    conn: sqlite3.Connection,
+    *,
+    serial_number: str,
+    client_id: str,
+    keep_sub_ids: set[str],
+) -> None:
+    """After upserting a license, remove subscription rows not present in the API payload."""
+    cur = conn.execute(
+        "SELECT * FROM license_subscriptions WHERE serial_number = ? AND client_id = ?",
+        (serial_number, client_id),
+    )
+    for r in cur.fetchall():
+        if r["id"] not in keep_sub_ids:
+            if _sync_change_ctx.get():
+                log_data_row_changes(
+                    conn,
+                    "license_subscriptions",
+                    {"id": r["id"]},
+                    r,
+                    None,
+                )
+            conn.execute(
+                "DELETE FROM license_subscriptions WHERE id = ?",
+                (r["id"],),
+            )
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -500,6 +1060,12 @@ def upsert_tenant(
     run_timestamp: str,
 ) -> None:
     """Insert or replace a tenant. Accepts central.classes.Tenant or dict-like."""
+    tid = _get(tenant, "id") or "unknown"
+    old = (
+        conn.execute("SELECT * FROM tenants WHERE id = ?", (tid,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     contact = _get(tenant, "contact")
     if contact is not None and not isinstance(contact, (str, type(None))):
         try:
@@ -516,7 +1082,7 @@ def upsert_tenant(
         products = [_get(p, "code") or p for p in products] if products else None
 
     row = (
-        _get(tenant, "id") or "unknown",
+        tid,
         _get(tenant, "showAs"),
         _get(tenant, "name") or "Unknown",
         _get(tenant, "dataGeography"),
@@ -563,6 +1129,9 @@ def upsert_tenant(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute("SELECT * FROM tenants WHERE id = ?", (tid,)).fetchone()
+        log_data_row_changes(conn, "tenants", {"id": tid}, old, new)
 
 
 def upsert_firewall(
@@ -574,6 +1143,13 @@ def upsert_firewall(
     run_timestamp: str,
 ) -> None:
     """Insert or replace a firewall. Accepts central.firewalls.classes.Firewall."""
+    old = (
+        conn.execute(
+            "SELECT * FROM firewalls WHERE id = ?", (firewall.id,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     tenant_id = getattr(getattr(firewall, "tenant", None), "id", None) or (getattr(firewall, "tenant") or {}).get("id")
     group = getattr(firewall, "group", None)
     group_id = getattr(group, "id", None) if group else None
@@ -643,6 +1219,11 @@ def upsert_firewall(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM firewalls WHERE id = ?", (firewall.id,)
+        ).fetchone()
+        log_data_row_changes(conn, "firewalls", {"id": firewall.id}, old, new)
 
 
 def upsert_license(
@@ -661,6 +1242,13 @@ def upsert_license(
     partner_id = partner_id or (getattr(license_obj.partner, "id", None) if getattr(license_obj, "partner", None) else None)
     org_id = getattr(license_obj.organization, "id", None) if getattr(license_obj, "organization", None) else None
 
+    old_lic = (
+        conn.execute(
+            "SELECT * FROM licenses WHERE serial_number = ?", (serial,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     conn.execute(
         """
         INSERT INTO licenses (
@@ -693,9 +1281,23 @@ def upsert_license(
             client_id,
         ),
     )
+    if _sync_change_ctx.get():
+        new_lic = conn.execute(
+            "SELECT * FROM licenses WHERE serial_number = ?", (serial,)
+        ).fetchone()
+        log_data_row_changes(
+            conn, "licenses", {"serial_number": serial}, old_lic, new_lic
+        )
 
     subs = getattr(license_obj, "licenses", None) or []
     for sub in subs:
+        old_sub = (
+            conn.execute(
+                "SELECT * FROM license_subscriptions WHERE id = ?", (sub.id,)
+            ).fetchone()
+            if _sync_change_ctx.get()
+            else None
+        )
         product = getattr(sub, "product", None)
         product_code = getattr(product, "code", None) if product else None
         product_name = getattr(product, "name", None) if product else None
@@ -751,6 +1353,24 @@ def upsert_license(
                 client_id,
             ),
         )
+        if _sync_change_ctx.get():
+            new_sub = conn.execute(
+                "SELECT * FROM license_subscriptions WHERE id = ?", (sub.id,)
+            ).fetchone()
+            log_data_row_changes(
+                conn,
+                "license_subscriptions",
+                {"id": sub.id},
+                old_sub,
+                new_sub,
+            )
+
+    delete_stale_license_subscriptions_for_serial(
+        conn,
+        serial_number=serial,
+        client_id=client_id,
+        keep_sub_ids={sub.id for sub in subs},
+    )
 
 
 def upsert_alert(
@@ -764,6 +1384,11 @@ def upsert_alert(
 ) -> None:
     """Insert or replace an alert. Accepts central.alerts.classes.Alert or dict-like."""
     aid = _get(alert, "id") or "unknown"
+    old = (
+        conn.execute("SELECT * FROM alerts WHERE id = ?", (aid,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     tenant_ref = _get(alert, "tenant")
     tid = tenant_id or (_get_nested(tenant_ref, "id") if tenant_ref else None)
     managed_json = _to_json(_get(alert, "managedAgent"))
@@ -816,6 +1441,9 @@ def upsert_alert(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute("SELECT * FROM alerts WHERE id = ?", (aid,)).fetchone()
+        log_data_row_changes(conn, "alerts", {"id": aid}, old, new)
 
 
 def upsert_alert_detail(
@@ -829,6 +1457,11 @@ def upsert_alert_detail(
 ) -> None:
     """Insert or replace a row in alert_details (full alert from get_alert). Same shape as alerts."""
     aid = _get(alert, "id") or "unknown"
+    old = (
+        conn.execute("SELECT * FROM alert_details WHERE id = ?", (aid,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     tenant_ref = _get(alert, "tenant")
     tid = tenant_id or (_get_nested(tenant_ref, "id") if tenant_ref else None)
     managed_json = _to_json(_get(alert, "managedAgent"))
@@ -881,6 +1514,11 @@ def upsert_alert_detail(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM alert_details WHERE id = ?", (aid,)
+        ).fetchone()
+        log_data_row_changes(conn, "alert_details", {"id": aid}, old, new)
 
 
 def upsert_firmware_upgrade(
@@ -893,6 +1531,13 @@ def upsert_firmware_upgrade(
     run_timestamp: str,
 ) -> None:
     """Insert or replace a firewall firmware upgrade row. Accepts FirewallUpgrade."""
+    old = (
+        conn.execute(
+            "SELECT * FROM firmware_upgrades WHERE firewall_id = ?", (upgrade.id,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     upgrade_to = getattr(upgrade, "upgradeToVersion", None) or []
     row = (
         upgrade.id,
@@ -923,6 +1568,18 @@ def upsert_firmware_upgrade(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM firmware_upgrades WHERE firewall_id = ?",
+            (upgrade.id,),
+        ).fetchone()
+        log_data_row_changes(
+            conn,
+            "firmware_upgrades",
+            {"firewall_id": upgrade.id},
+            old,
+            new,
+        )
 
 
 def upsert_firmware_version(
@@ -934,6 +1591,14 @@ def upsert_firmware_version(
     run_timestamp: str,
 ) -> None:
     """Insert or replace a firmware version (release notes). Accepts FirmwareVersion."""
+    ver = fw_version.version
+    old = (
+        conn.execute(
+            "SELECT * FROM firmware_versions WHERE version = ?", (ver,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     row = (
         fw_version.version,
         getattr(fw_version, "size", None),
@@ -960,6 +1625,13 @@ def upsert_firmware_version(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM firmware_versions WHERE version = ?", (ver,)
+        ).fetchone()
+        log_data_row_changes(
+            conn, "firmware_versions", {"version": ver}, old, new
+        )
 
 
 def _scalar_text(val: Any) -> Optional[str]:
@@ -984,6 +1656,13 @@ def upsert_firewall_group(
 ) -> None:
     """Persist a firewall group from ``get_firewall_groups`` (object or dict-like)."""
     gid = _get(group, "id") or "unknown"
+    old = (
+        conn.execute(
+            "SELECT * FROM firewall_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     parent = _get(group, "parentGroup")
     parent_id = _get(parent, "id") if parent else None
     fws = _get(group, "firewalls")
@@ -1038,6 +1717,11 @@ def upsert_firewall_group(
         """,
         row,
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM firewall_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        log_data_row_changes(conn, "firewall_groups", {"id": gid}, old, new)
 
 
 def update_firewall_group_items_json_from_sync(
@@ -1048,6 +1732,13 @@ def update_firewall_group_items_json_from_sync(
     """Set ``firewalls_items_json`` and counts from sync-status membership (API list may omit ``firewalls.items``)."""
     n = len(items)
     payload = json.dumps(items)
+    old = (
+        conn.execute(
+            "SELECT * FROM firewall_groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     conn.execute(
         """
         UPDATE firewall_groups SET
@@ -1058,6 +1749,18 @@ def update_firewall_group_items_json_from_sync(
         """,
         (payload, n, n, group_id),
     )
+    if _sync_change_ctx.get() and old is not None:
+        new = conn.execute(
+            "SELECT * FROM firewall_groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if new is not None:
+            log_data_row_changes(
+                conn,
+                "firewall_groups",
+                {"id": group_id},
+                old,
+                new,
+            )
 
 
 def upsert_firewall_group_sync_status(
@@ -1073,6 +1776,17 @@ def upsert_firewall_group_sync_status(
     run_timestamp: str,
 ) -> None:
     """One row per (group, firewall) from ``get_firewall_group_sync_status``."""
+    old = (
+        conn.execute(
+            """
+            SELECT * FROM firewall_group_sync_status
+            WHERE group_id = ? AND firewall_id = ?
+            """,
+            (group_id, firewall_id),
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     conn.execute(
         """
         INSERT INTO firewall_group_sync_status (
@@ -1099,6 +1813,21 @@ def upsert_firewall_group_sync_status(
             client_id,
         ),
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            """
+            SELECT * FROM firewall_group_sync_status
+            WHERE group_id = ? AND firewall_id = ?
+            """,
+            (group_id, firewall_id),
+        ).fetchone()
+        log_data_row_changes(
+            conn,
+            "firewall_group_sync_status",
+            {"group_id": group_id, "firewall_id": firewall_id},
+            old,
+            new,
+        )
 
 
 def upsert_mdr_threat_feed_sync(
@@ -1117,6 +1846,14 @@ def upsert_mdr_threat_feed_sync(
     detail_message: Optional[str] = None,
 ) -> None:
     """Latest MDR threat-feed fetch + transaction poll outcome per firewall."""
+    old = (
+        conn.execute(
+            "SELECT * FROM mdr_threat_feed_sync WHERE firewall_id = ?",
+            (firewall_id,),
+        ).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     conn.execute(
         """
         INSERT INTO mdr_threat_feed_sync (
@@ -1151,3 +1888,15 @@ def upsert_mdr_threat_feed_sync(
             client_id,
         ),
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM mdr_threat_feed_sync WHERE firewall_id = ?",
+            (firewall_id,),
+        ).fetchone()
+        log_data_row_changes(
+            conn,
+            "mdr_threat_feed_sync",
+            {"firewall_id": firewall_id},
+            old,
+            new,
+        )

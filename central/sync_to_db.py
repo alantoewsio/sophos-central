@@ -29,11 +29,23 @@ from central.session import CentralSession
 from central.classes import ReturnState
 from central.db import (
     DEFAULT_DB_PATH,
+    _sync_change_ctx,
+    delete_stale_firewall_group_sync_status_for_tenant,
+    delete_stale_firewall_groups_for_tenant,
+    delete_stale_firmware_upgrades_for_tenant,
+    delete_stale_firmware_versions_for_client,
+    delete_stale_firewalls_for_tenant,
+    delete_stale_licenses_for_tenant,
+    delete_stale_mdr_for_tenant,
+    delete_stale_partner_licenses,
+    delete_stale_tenants_for_partner,
     get_connection,
     get_latest_alert_raised_at,
     get_new_alert_ids,
     get_run_summary,
     init_schema,
+    log_data_row_changes,
+    sync_change_logging,
     upsert_tenant,
     upsert_firewall,
     upsert_license,
@@ -386,6 +398,11 @@ def ensure_tenant_record(
     run_timestamp: str,
 ) -> None:
     """Ensure a tenant row exists for single-tenant mode (e.g. from whoami)."""
+    old = (
+        conn.execute("SELECT * FROM tenants WHERE id = ?", (whoami_id,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
     conn.execute(
         """
         INSERT INTO tenants (
@@ -411,6 +428,11 @@ def ensure_tenant_record(
             client_id,
         ),
     )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM tenants WHERE id = ?", (whoami_id,)
+        ).fetchone()
+        log_data_row_changes(conn, "tenants", {"id": whoami_id}, old, new)
 
 
 SUMMARY_TABLES = (
@@ -425,6 +447,7 @@ SUMMARY_TABLES = (
     "firewall_groups",
     "firewall_group_sync_status",
     "mdr_threat_feed_sync",
+    "sync_change_events",
 )
 
 # Pre-built SELECT * queries per table (table names are fixed; no user input).
@@ -440,6 +463,7 @@ _SELECT_ALL_QUERIES = {
     "firewall_groups": "SELECT * FROM firewall_groups",
     "firewall_group_sync_status": "SELECT * FROM firewall_group_sync_status",
     "mdr_threat_feed_sync": "SELECT * FROM mdr_threat_feed_sync",
+    "sync_change_events": "SELECT * FROM sync_change_events",
 }
 
 # Excel sheet names must be <= 31 chars; our table names fit
@@ -482,12 +506,42 @@ def sync_partner(
     """Sync all tenants and per-tenant firewalls and licenses; then partner-level licenses."""
     if elapsed_by_table is None:
         elapsed_by_table = {}
+    with sync_change_logging(update_id, client_id, run_timestamp):
+        _sync_partner_body(
+            conn,
+            central,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            elapsed_by_table=elapsed_by_table,
+            progress=progress,
+            sync_mdr=sync_mdr,
+        )
+
+
+def _sync_partner_body(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float],
+    progress: SyncProgress | None,
+    sync_mdr: bool,
+) -> None:
     tenants_result = central.get_tenants()
+    tenants_api_ok = not (
+        isinstance(tenants_result, ReturnState) and not tenants_result.success
+    )
     if isinstance(tenants_result, ReturnState) and not tenants_result.success:
         logger.warning("Could not fetch tenants: %s", tenants_result.message)
         tenants = []
     else:
         tenants = list(tenants_result)
+    tenant_ids_seen = {t.id for t in tenants}
+    firmware_versions_prune = False
+    all_firmware_versions: set[str] = set()
 
     steps_per_tenant = 8 + (1 if sync_mdr else 0)
     total_steps = len(tenants) * steps_per_tenant + 1
@@ -544,6 +598,16 @@ def sync_partner(
             len(firewalls),
             _format_duration(elapsed),
         )
+        firewalls_api_ok = not (
+            isinstance(firewalls_result, ReturnState) and not firewalls_result.success
+        )
+        delete_stale_firewalls_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_ids={fw.id for fw in firewalls},
+            api_ok=firewalls_api_ok,
+        )
         step += 1
 
         if progress is not None:
@@ -576,6 +640,21 @@ def sync_partner(
             tenant.name,
             len(licenses_result) if not isinstance(licenses_result, ReturnState) else 0,
             _format_duration(elapsed),
+        )
+        licenses_api_ok = not (
+            isinstance(licenses_result, ReturnState) and not licenses_result.success
+        )
+        lic_serials = (
+            {lic.serialNumber for lic in licenses_result}
+            if licenses_api_ok
+            else set()
+        )
+        delete_stale_licenses_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_serials=lic_serials,
+            api_ok=licenses_api_ok,
         )
         step += 1
 
@@ -691,6 +770,22 @@ def sync_partner(
                         update_id=update_id,
                         run_timestamp=run_timestamp,
                     )
+            fw_api_ok = not (
+                isinstance(firmware_result, ReturnState)
+                and not firmware_result.success
+            )
+            if fw_api_ok:
+                firmware_versions_prune = True
+                all_firmware_versions.update(
+                    v.version for v in firmware_result.firmwareVersions
+                )
+            delete_stale_firmware_upgrades_for_tenant(
+                conn,
+                client_id=client_id,
+                tenant_id=tenant.id,
+                keep_firewall_ids={fw.id for fw in firewalls},
+                api_ok=fw_api_ok,
+            )
             elapsed = time.perf_counter() - t0
             elapsed_by_table["firmware_upgrades"] = (
                 elapsed_by_table.get("firmware_upgrades", 0) + elapsed
@@ -747,6 +842,16 @@ def sync_partner(
             len(groups_list),
             _format_duration(elapsed),
         )
+        groups_api_ok = not (
+            isinstance(groups_result, ReturnState) and not groups_result.success
+        )
+        delete_stale_firewall_groups_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_ids={grp.id for grp in groups_list},
+            api_ok=groups_api_ok,
+        )
         step += 1
 
         if progress is not None:
@@ -755,6 +860,8 @@ def sync_partner(
             )
         t0 = time.perf_counter()
         n_sync_rows = 0
+        fgss_pairs: set[tuple[str, str]] = set()
+        fgss_all_groups_ok = groups_api_ok
         for grp in groups_list:
             sync_res = get_firewall_group_sync_status(
                 central,
@@ -769,10 +876,12 @@ def sync_partner(
                     grp.id,
                     sync_res.message,
                 )
+                fgss_all_groups_ok = False
                 continue
             items_payload: list[dict[str, str]] = []
             for row in sync_res:
                 items_payload.append({"id": row.firewall.id})
+                fgss_pairs.add((grp.id, row.firewall.id))
                 upsert_firewall_group_sync_status(
                     conn,
                     group_id=grp.id,
@@ -795,6 +904,13 @@ def sync_partner(
             tenant.name,
             n_sync_rows,
             _format_duration(elapsed),
+        )
+        delete_stale_firewall_group_sync_status_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_pairs=fgss_pairs,
+            api_ok=fgss_all_groups_ok,
         )
         step += 1
 
@@ -824,6 +940,14 @@ def sync_partner(
                 _format_duration(elapsed),
             )
             step += 1
+        delete_stale_mdr_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_firewall_ids={fw.id for fw in firewalls},
+            sync_mdr=sync_mdr,
+            api_ok=firewalls_api_ok,
+        )
 
     if progress is not None:
         progress.update("Partner-level licenses", step)
@@ -857,6 +981,34 @@ def sync_partner(
         else 0,
         _format_duration(elapsed),
     )
+    partner_lic_api_ok = not (
+        isinstance(partner_licenses_result, ReturnState)
+        and not partner_licenses_result.success
+    )
+    partner_serials = (
+        {lic.serialNumber for lic in partner_licenses_result}
+        if partner_lic_api_ok
+        else set()
+    )
+    delete_stale_partner_licenses(
+        conn,
+        client_id=client_id,
+        partner_id=central.whoami.id,
+        keep_serials=partner_serials,
+        api_ok=partner_lic_api_ok,
+    )
+    delete_stale_tenants_for_partner(
+        conn,
+        client_id=client_id,
+        keep_tenant_ids=tenant_ids_seen,
+        api_ok=tenants_api_ok,
+    )
+    delete_stale_firmware_versions_for_client(
+        conn,
+        client_id=client_id,
+        keep_versions=all_firmware_versions,
+        prune=firmware_versions_prune,
+    )
 
 
 def sync_tenant(
@@ -873,6 +1025,32 @@ def sync_tenant(
     """Sync current tenant context: one tenant row, firewalls, licenses, groups, optional MDR."""
     if elapsed_by_table is None:
         elapsed_by_table = {}
+    with sync_change_logging(update_id, client_id, run_timestamp):
+        _sync_tenant_body(
+            conn,
+            central,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            elapsed_by_table=elapsed_by_table,
+            progress=progress,
+            sync_mdr=sync_mdr,
+        )
+
+
+def _sync_tenant_body(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float],
+    progress: SyncProgress | None,
+    sync_mdr: bool,
+) -> None:
+    firmware_versions_prune = False
+    all_firmware_versions: set[str] = set()
     if progress is not None:
         progress.set_total(8 + (1 if sync_mdr else 0))
     whoami = central.whoami
@@ -914,6 +1092,16 @@ def sync_tenant(
     logger.info(
         "Firewalls synced: %d (%s)", len(firewalls_list), _format_duration(elapsed)
     )
+    firewalls_api_ok = not (
+        isinstance(firewalls_result, ReturnState) and not firewalls_result.success
+    )
+    delete_stale_firewalls_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_ids={fw.id for fw in firewalls_list},
+        api_ok=firewalls_api_ok,
+    )
 
     if progress is not None:
         progress.update("Licenses", 2)
@@ -942,6 +1130,21 @@ def sync_tenant(
         "Licenses synced: %d (%s)",
         len(licenses_result) if not isinstance(licenses_result, ReturnState) else 0,
         _format_duration(elapsed),
+    )
+    licenses_api_ok = not (
+        isinstance(licenses_result, ReturnState) and not licenses_result.success
+    )
+    lic_serials = (
+        {lic.serialNumber for lic in licenses_result}
+        if licenses_api_ok
+        else set()
+    )
+    delete_stale_licenses_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_serials=lic_serials,
+        api_ok=licenses_api_ok,
     )
 
     if progress is not None:
@@ -1039,6 +1242,21 @@ def sync_tenant(
                     update_id=update_id,
                     run_timestamp=run_timestamp,
                 )
+        fw_api_ok = not (
+            isinstance(firmware_result, ReturnState) and not firmware_result.success
+        )
+        if fw_api_ok:
+            firmware_versions_prune = True
+            all_firmware_versions.update(
+                v.version for v in firmware_result.firmwareVersions
+            )
+        delete_stale_firmware_upgrades_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=whoami.id,
+            keep_firewall_ids={fw.id for fw in firewalls_list},
+            api_ok=fw_api_ok,
+        )
         elapsed = time.perf_counter() - t0
         elapsed_by_table["firmware_upgrades"] = (
             elapsed_by_table.get("firmware_upgrades", 0) + elapsed
@@ -1088,11 +1306,23 @@ def sync_tenant(
         len(groups_list),
         _format_duration(elapsed),
     )
+    groups_api_ok = not (
+        isinstance(groups_result, ReturnState) and not groups_result.success
+    )
+    delete_stale_firewall_groups_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_ids={grp.id for grp in groups_list},
+        api_ok=groups_api_ok,
+    )
 
     if progress is not None:
         progress.update("Firewall group sync status", 7)
     t0 = time.perf_counter()
     n_sync_rows = 0
+    fgss_pairs: set[tuple[str, str]] = set()
+    fgss_all_groups_ok = groups_api_ok
     for grp in groups_list:
         sync_res = get_firewall_group_sync_status(
             central,
@@ -1104,10 +1334,12 @@ def sync_tenant(
             logger.warning(
                 "Group sync status for %s: %s", grp.id, sync_res.message
             )
+            fgss_all_groups_ok = False
             continue
         items_payload: list[dict[str, str]] = []
         for row in sync_res:
             items_payload.append({"id": row.firewall.id})
+            fgss_pairs.add((grp.id, row.firewall.id))
             upsert_firewall_group_sync_status(
                 conn,
                 group_id=grp.id,
@@ -1129,6 +1361,13 @@ def sync_tenant(
         "Group sync status rows: %d (%s)",
         n_sync_rows,
         _format_duration(elapsed),
+    )
+    delete_stale_firewall_group_sync_status_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_pairs=fgss_pairs,
+        api_ok=fgss_all_groups_ok,
     )
 
     if sync_mdr and firewalls_list:
@@ -1155,6 +1394,20 @@ def sync_tenant(
             len(firewalls_list),
             _format_duration(elapsed),
         )
+    delete_stale_mdr_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_firewall_ids={fw.id for fw in firewalls_list},
+        sync_mdr=sync_mdr,
+        api_ok=firewalls_api_ok,
+    )
+    delete_stale_firmware_versions_for_client(
+        conn,
+        client_id=client_id,
+        keep_versions=all_firmware_versions,
+        prune=firmware_versions_prune,
+    )
 
 
 @contextmanager

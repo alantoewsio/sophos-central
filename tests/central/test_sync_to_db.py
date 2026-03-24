@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import io
 import json
-import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -319,6 +317,7 @@ def test_sync_partner_minimal(
     mock_alerts.return_value = ReturnState(success=False, message="x")
     mock_fw_up.return_value = ReturnState(success=False, message="x")
     central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
     central.get_tenants.return_value = ReturnState(success=False, message="no tenants")
     sync_partner(
         db_conn,
@@ -479,6 +478,7 @@ def test_sync_partner_licenses_and_firmware_success(mock_gfw, mock_lic, mock_ale
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_partner_with_latest_raised_from_time(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
     tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
     central.get_tenants.return_value = [tenant]
     mock_gfw.return_value = []
