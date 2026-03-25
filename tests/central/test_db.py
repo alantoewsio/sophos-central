@@ -377,3 +377,154 @@ def test_init_schema_logs(mock_log, tmp_path: Path):
     c = db.get_connection(tmp_path / "z.db")
     db.init_schema(c)
     mock_log.debug.assert_called()
+
+
+def test_upsert_tenant_role_admin_and_delete_stale(db_conn):
+    db.upsert_tenant(
+        db_conn,
+        {"id": "trt1", "name": "T", "showAs": "T"},
+        client_id="oauth-cid",
+        update_id="u0",
+        run_timestamp="ts0",
+    )
+    role = {
+        "id": "role-1",
+        "name": "Admin",
+        "description": "d",
+        "type": "predefined",
+        "principalType": "user",
+        "permissionSets": ["ps1"],
+        "createdAt": "2020-01-01T00:00:00Z",
+    }
+    db.upsert_tenant_role(
+        db_conn,
+        role,
+        tenant_id="trt1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+    )
+    admin = {
+        "id": "adm-1",
+        "tenant": {"id": "trt1"},
+        "users": [],
+        "profile": {"name": "N", "firstName": "N", "email": "e@x"},
+        "roleAssignments": [{"id": "ra1", "roleId": "role-1"}],
+    }
+    db.upsert_tenant_admin(
+        db_conn,
+        admin,
+        tenant_id="trt1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_roles").fetchone()[0] == 1
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_admins").fetchone()[0] == 1
+
+    with db.sync_change_logging("s2", "oauth-cid", "ts2"):
+        db.upsert_tenant_role(
+            db_conn,
+            {**role, "name": "Admin2"},
+            tenant_id="trt1",
+            client_id="oauth-cid",
+            update_id="u2",
+            run_timestamp="ts2",
+        )
+        db.upsert_tenant_admin(
+            db_conn,
+            {**admin, "profile": {**admin["profile"], "name": "N2"}},
+            tenant_id="trt1",
+            client_id="oauth-cid",
+            update_id="u2",
+            run_timestamp="ts2",
+        )
+
+    db.upsert_tenant_role(
+        db_conn,
+        {
+            "id": "role-2",
+            "name": "R2",
+            "type": "custom",
+            "principalType": "user",
+            "permissionSets": [],
+        },
+        tenant_id="trt1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+    )
+    db.upsert_tenant_admin(
+        db_conn,
+        {
+            "id": "adm-2",
+            "tenant": {"id": "trt1"},
+            "users": [],
+            "profile": {"name": "A2", "email": "a2@x"},
+            "roleAssignments": [],
+        },
+        tenant_id="trt1",
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_roles").fetchone()[0] == 2
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_admins").fetchone()[0] == 2
+
+    db.delete_stale_tenant_roles_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids={"role-1"},
+        api_ok=True,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_roles").fetchone()[0] == 1
+    assert (
+        db_conn.execute("SELECT id FROM tenant_roles").fetchone()[0] == "role-1"
+    )
+
+    db.delete_stale_tenant_admins_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids={"adm-2"},
+        api_ok=True,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_admins").fetchone()[0] == 1
+    assert db_conn.execute("SELECT id FROM tenant_admins").fetchone()[0] == "adm-2"
+
+    db.delete_stale_tenant_roles_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids=set(),
+        api_ok=False,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_roles").fetchone()[0] == 1
+
+    db.delete_stale_tenant_admins_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids={"adm-2"},
+        api_ok=False,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_admins").fetchone()[0] == 1
+
+    db.delete_stale_tenant_roles_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids=set(),
+        api_ok=True,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_roles").fetchone()[0] == 0
+
+    db.delete_stale_tenant_admins_for_tenant(
+        db_conn,
+        client_id="oauth-cid",
+        tenant_id="trt1",
+        keep_ids=set(),
+        api_ok=True,
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM tenant_admins").fetchone()[0] == 0

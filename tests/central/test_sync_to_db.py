@@ -45,6 +45,8 @@ _SUMMARY_TABLE_KEYS = (
     "firewall_groups",
     "firewall_group_sync_status",
     "mdr_threat_feed_sync",
+    "tenant_roles",
+    "tenant_admins",
 )
 
 
@@ -307,9 +309,11 @@ def test_export_db_to_xlsx(db_conn, tmp_path: Path):
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_partner_minimal(
-    mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up,
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up,
     db_conn,
 ):
     mock_gfw.return_value = ReturnState(success=False, message="x")
@@ -361,9 +365,11 @@ def test_sync_partner_minimal(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_partner_with_alerts_and_details(
-    mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
 ):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="p1")
@@ -405,9 +411,11 @@ def test_sync_partner_with_alerts_and_details(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_partner_licenses_fail_alerts_fail(
-    mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
 ):
     """Firewalls success (empty list) so firewalls is bound; licenses and alerts fail."""
     central = MagicMock()
@@ -429,8 +437,10 @@ def test_sync_partner_licenses_fail_alerts_fail(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_partner_licenses_and_firmware_success(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
+def test_sync_partner_licenses_and_firmware_success(mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     """Cover 354, 455, 470, 507: tenant licenses success, firmware success with versions, partner licenses success."""
     lic = SimpleNamespace(
         serialNumber="S",
@@ -475,8 +485,10 @@ def test_sync_partner_licenses_and_firmware_success(mock_gfw, mock_lic, mock_ale
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_partner_with_latest_raised_from_time(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
+def test_sync_partner_with_latest_raised_from_time(mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="p1")
     tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
@@ -494,8 +506,10 @@ def test_sync_partner_with_latest_raised_from_time(mock_gfw, mock_lic, mock_aler
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_tenant_paths(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
+def test_sync_tenant_paths(mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
     mock_gfw.return_value = ReturnState(success=False, message="e")
@@ -524,9 +538,32 @@ def test_sync_tenant_paths(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins")
+@patch("central.sync_to_db.get_roles")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_tenant_roles_admins_api_fail(
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
+    mock_roles.return_value = ReturnState(success=False, message="roles err")
+    mock_admins.return_value = ReturnState(success=False, message="admins err")
+    mock_gfw.return_value = []
+    mock_lic.return_value = ReturnState(success=False, message="e")
+    mock_alerts.return_value = ReturnState(success=False, message="e")
+    mock_fw_up.return_value = ReturnState(success=False, message="e")
+    sync_tenant(db_conn, central, client_id="oauth-cid", update_id="u", run_timestamp="ts", progress=None)
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_tenant_with_latest_raised_and_alert_details(
-    mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
 ):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
@@ -557,9 +594,11 @@ def test_sync_tenant_with_latest_raised_and_alert_details(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 def test_sync_tenant_with_progress_and_firmware_success(
-    mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+    mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn
 ):
     """Cover 538->540, 585, 671, 682: progress updates and firmware success with firewalls + versions."""
     lic = SimpleNamespace(
@@ -600,8 +639,10 @@ def test_sync_tenant_with_progress_and_firmware_success(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_tenant_licenses_fail(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
+def test_sync_tenant_licenses_fail(mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
     mock_gfw.return_value = []
@@ -617,8 +658,10 @@ def test_sync_tenant_licenses_fail(mock_gfw, mock_lic, mock_alerts, mock_get_ale
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_tenant_alert_detail_return_state(mock_gfw, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
+def test_sync_tenant_alert_detail_return_state(mock_gfw, mock_roles, mock_admins, mock_lic, mock_alerts, mock_get_alert, mock_fw_up, db_conn):
     central = MagicMock()
     central.whoami = SimpleNamespace(id="t1", data_region_url=lambda: "https://d/")
     mock_gfw.return_value = []
@@ -1015,6 +1058,8 @@ def test_mdr_sync_poll_return_state_fails(db_conn):
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1022,6 +1067,8 @@ def test_sync_partner_groups_sync_status_and_mdr(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1088,6 +1135,8 @@ def test_sync_partner_groups_sync_status_and_mdr(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1095,6 +1144,8 @@ def test_sync_partner_groups_api_failures(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1141,6 +1192,8 @@ def test_sync_partner_groups_api_failures(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1148,6 +1201,8 @@ def test_sync_partner_firewall_api_failure_warns(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1182,6 +1237,8 @@ def test_sync_partner_firewall_api_failure_warns(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1189,6 +1246,8 @@ def test_sync_partner_firmware_upgrade_check_fails(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1228,6 +1287,8 @@ def test_sync_partner_firmware_upgrade_check_fails(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1235,6 +1296,8 @@ def test_sync_partner_mdr_with_progress_updates(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1280,6 +1343,8 @@ def test_sync_partner_mdr_with_progress_updates(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1287,6 +1352,8 @@ def test_sync_partner_alert_detail_skips_return_state(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1322,6 +1389,8 @@ def test_sync_partner_alert_detail_skips_return_state(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1329,6 +1398,8 @@ def test_sync_tenant_firewall_groups_api_fail(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1361,6 +1432,8 @@ def test_sync_tenant_firewall_groups_api_fail(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1368,6 +1441,8 @@ def test_sync_tenant_groups_sync_mdr_and_firmware_fail(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1428,6 +1503,8 @@ def test_sync_progress_no_color_ljusts_line(mock_isatty, mock_gs, monkeypatch, c
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1435,6 +1512,8 @@ def test_sync_partner_group_sync_status_call_fails(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,
@@ -1469,6 +1548,8 @@ def test_sync_partner_group_sync_status_call_fails(
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_licenses")
+@patch("central.sync_to_db.get_admins", return_value=[])
+@patch("central.sync_to_db.get_roles", return_value=[])
 @patch("central.sync_to_db.get_firewalls")
 @patch("central.sync_to_db.get_firewall_group_sync_status")
 @patch("central.sync_to_db.get_firewall_groups")
@@ -1476,6 +1557,8 @@ def test_sync_tenant_group_sync_status_call_fails(
     mock_grp,
     mock_gss,
     mock_gfw,
+    mock_roles,
+    mock_admins,
     mock_lic,
     mock_alerts,
     mock_get_alert,

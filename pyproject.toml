@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sfos-central-sdk"
-version = "0.9.4"
+version = "0.9.5"
 description = "CLI and Python API for Sophos Central (firewalls, licenses, alerts, firmware)"
 readme = "README.md"
 license = "Apache-2.0"

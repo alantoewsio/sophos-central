@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Companion script: sync tenants, firewalls, firewall groups, group sync status, optional MDR threat-feed
-snapshots, licenses, alerts, and firmware update info from Sophos Central to a local SQLite DB.
+Companion script: sync tenants, tenant roles and admins, firewalls, firewall groups, group sync status,
+optional MDR threat-feed snapshots, licenses, alerts, and firmware update info from Sophos Central to SQLite.
 Updates existing records and inserts new ones. Uses credentials from credentials.env or .env.
 """
 
@@ -38,6 +38,8 @@ from central.db import (
     delete_stale_licenses_for_tenant,
     delete_stale_mdr_for_tenant,
     delete_stale_partner_licenses,
+    delete_stale_tenant_admins_for_tenant,
+    delete_stale_tenant_roles_for_tenant,
     delete_stale_tenants_for_partner,
     get_connection,
     get_latest_alert_raised_at,
@@ -57,7 +59,10 @@ from central.db import (
     update_firewall_group_items_json_from_sync,
     upsert_firewall_group_sync_status,
     upsert_mdr_threat_feed_sync,
+    upsert_tenant_admin,
+    upsert_tenant_role,
 )
+from central.common.methods import get_admins, get_roles
 from central.firewalls.methods import get_firewalls
 from central.firewalls.licenses import get_licenses
 from central.alerts.methods import get_alert, get_alerts
@@ -447,6 +452,8 @@ SUMMARY_TABLES = (
     "firewall_groups",
     "firewall_group_sync_status",
     "mdr_threat_feed_sync",
+    "tenant_roles",
+    "tenant_admins",
     "sync_change_events",
 )
 
@@ -463,6 +470,8 @@ _SELECT_ALL_QUERIES = {
     "firewall_groups": "SELECT * FROM firewall_groups",
     "firewall_group_sync_status": "SELECT * FROM firewall_group_sync_status",
     "mdr_threat_feed_sync": "SELECT * FROM mdr_threat_feed_sync",
+    "tenant_roles": "SELECT * FROM tenant_roles",
+    "tenant_admins": "SELECT * FROM tenant_admins",
     "sync_change_events": "SELECT * FROM sync_change_events",
 }
 
@@ -543,7 +552,7 @@ def _sync_partner_body(
     firmware_versions_prune = False
     all_firmware_versions: set[str] = set()
 
-    steps_per_tenant = 8 + (1 if sync_mdr else 0)
+    steps_per_tenant = 10 + (1 if sync_mdr else 0)
     total_steps = len(tenants) * steps_per_tenant + 1
     if progress is not None:
         progress.set_total(total_steps)
@@ -565,6 +574,98 @@ def _sync_partner_body(
             time.perf_counter() - t0
         )
         logger.debug("Tenant upserted: %s (%s)", tenant.name, tenant.id)
+        step += 1
+
+        if progress is not None:
+            progress.update(f"Tenant {tenant.name!r}: roles", step)
+        t0 = time.perf_counter()
+        roles_result = get_roles(
+            central,
+            tenant_id=tenant.id,
+            url_base=tenant.apiHost,
+        )
+        roles_list: list = []
+        if isinstance(roles_result, ReturnState) and not roles_result.success:
+            logger.warning(
+                "Roles for tenant %s: %s", tenant.id, roles_result.message
+            )
+        else:
+            roles_list = list(roles_result)
+            for role in roles_list:
+                upsert_tenant_role(
+                    conn,
+                    role,
+                    tenant_id=tenant.id,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["tenant_roles"] = (
+            elapsed_by_table.get("tenant_roles", 0) + elapsed
+        )
+        logger.info(
+            "Tenant %s: %d roles synced (%s)",
+            tenant.name,
+            len(roles_list),
+            _format_duration(elapsed),
+        )
+        roles_api_ok = not (
+            isinstance(roles_result, ReturnState) and not roles_result.success
+        )
+        delete_stale_tenant_roles_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_ids={r.id for r in roles_list},
+            api_ok=roles_api_ok,
+        )
+        step += 1
+
+        if progress is not None:
+            progress.update(f"Tenant {tenant.name!r}: admins", step)
+        t0 = time.perf_counter()
+        admins_result = get_admins(
+            central,
+            tenant_id=tenant.id,
+            url_base=tenant.apiHost,
+        )
+        admins_list: list = []
+        if isinstance(admins_result, ReturnState) and not admins_result.success:
+            logger.warning(
+                "Admins for tenant %s: %s", tenant.id, admins_result.message
+            )
+        else:
+            admins_list = list(admins_result)
+            for adm in admins_list:
+                upsert_tenant_admin(
+                    conn,
+                    adm,
+                    tenant_id=tenant.id,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["tenant_admins"] = (
+            elapsed_by_table.get("tenant_admins", 0) + elapsed
+        )
+        logger.info(
+            "Tenant %s: %d admins synced (%s)",
+            tenant.name,
+            len(admins_list),
+            _format_duration(elapsed),
+        )
+        admins_api_ok = not (
+            isinstance(admins_result, ReturnState) and not admins_result.success
+        )
+        delete_stale_tenant_admins_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant.id,
+            keep_ids={a.id for a in admins_list},
+            api_ok=admins_api_ok,
+        )
         step += 1
 
         if progress is not None:
@@ -1052,7 +1153,7 @@ def _sync_tenant_body(
     firmware_versions_prune = False
     all_firmware_versions: set[str] = set()
     if progress is not None:
-        progress.set_total(8 + (1 if sync_mdr else 0))
+        progress.set_total(10 + (1 if sync_mdr else 0))
     whoami = central.whoami
     url_base = whoami.data_region_url()
     if progress is not None:
@@ -1069,7 +1170,75 @@ def _sync_tenant_body(
     elapsed_by_table["tenants"] = time.perf_counter() - t0
 
     if progress is not None:
-        progress.update("Firewalls", 1)
+        progress.update("Roles", 1)
+    t0 = time.perf_counter()
+    roles_result = get_roles(
+        central, tenant_id=whoami.id, url_base=url_base
+    )
+    roles_list: list = []
+    if isinstance(roles_result, ReturnState) and not roles_result.success:
+        logger.warning("Roles: %s", roles_result.message)
+    else:
+        roles_list = list(roles_result)
+        for role in roles_list:
+            upsert_tenant_role(
+                conn,
+                role,
+                tenant_id=whoami.id,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+    elapsed_by_table["tenant_roles"] = (
+        elapsed_by_table.get("tenant_roles", 0) + (time.perf_counter() - t0)
+    )
+    roles_api_ok = not (
+        isinstance(roles_result, ReturnState) and not roles_result.success
+    )
+    delete_stale_tenant_roles_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_ids={r.id for r in roles_list},
+        api_ok=roles_api_ok,
+    )
+
+    if progress is not None:
+        progress.update("Admins", 2)
+    t0 = time.perf_counter()
+    admins_result = get_admins(
+        central, tenant_id=whoami.id, url_base=url_base
+    )
+    admins_list: list = []
+    if isinstance(admins_result, ReturnState) and not admins_result.success:
+        logger.warning("Admins: %s", admins_result.message)
+    else:
+        admins_list = list(admins_result)
+        for adm in admins_list:
+            upsert_tenant_admin(
+                conn,
+                adm,
+                tenant_id=whoami.id,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+    elapsed_by_table["tenant_admins"] = (
+        elapsed_by_table.get("tenant_admins", 0) + (time.perf_counter() - t0)
+    )
+    admins_api_ok = not (
+        isinstance(admins_result, ReturnState) and not admins_result.success
+    )
+    delete_stale_tenant_admins_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=whoami.id,
+        keep_ids={a.id for a in admins_list},
+        api_ok=admins_api_ok,
+    )
+
+    if progress is not None:
+        progress.update("Firewalls", 3)
     t0 = time.perf_counter()
     firewalls_result = get_firewalls(
         central, tenant_id=whoami.id, url_base=url_base
@@ -1104,7 +1273,7 @@ def _sync_tenant_body(
     )
 
     if progress is not None:
-        progress.update("Licenses", 2)
+        progress.update("Licenses", 4)
     t0 = time.perf_counter()
     licenses_result = get_licenses(
         central, tenant_id=whoami.id, url_base=url_base
@@ -1148,7 +1317,7 @@ def _sync_tenant_body(
     )
 
     if progress is not None:
-        progress.update("Alerts", 3)
+        progress.update("Alerts", 5)
     # Alerts for current tenant (firewall + other only; incremental from latest if any)
     from_time = None
     latest_raised = get_latest_alert_raised_at(conn, whoami.id)
@@ -1186,7 +1355,7 @@ def _sync_tenant_body(
     # Fetch and upsert full details for new alerts only
     new_alert_ids = get_new_alert_ids(conn, update_id, whoami.id)
     if progress is not None and not new_alert_ids:
-        progress.update("Alert details", 4)
+        progress.update("Alert details", 6)
     if new_alert_ids:
         n_alert_details = len(new_alert_ids)
         t0_details = time.perf_counter()
@@ -1194,7 +1363,7 @@ def _sync_tenant_body(
             if progress is not None:
                 progress.update(
                     f"Alert details ({i}/{n_alert_details})",
-                    4,
+                    6,
                 )
             detail_result = get_alert(
                 central, aid, tenant_id=whoami.id, url_base=url_base
@@ -1214,7 +1383,7 @@ def _sync_tenant_body(
         logger.info("Alert details synced: %d", len(new_alert_ids))
 
     if progress is not None:
-        progress.update("Firmware", 5)
+        progress.update("Firmware", 7)
     # Firmware upgrade info for current tenant's firewalls
     if firewalls_list:
         t0 = time.perf_counter()
@@ -1276,7 +1445,7 @@ def _sync_tenant_body(
         )
 
     if progress is not None:
-        progress.update("Firewall groups", 6)
+        progress.update("Firewall groups", 8)
     t0 = time.perf_counter()
     groups_result = get_firewall_groups(
         central,
@@ -1318,7 +1487,7 @@ def _sync_tenant_body(
     )
 
     if progress is not None:
-        progress.update("Firewall group sync status", 7)
+        progress.update("Firewall group sync status", 9)
     t0 = time.perf_counter()
     n_sync_rows = 0
     fgss_pairs: set[tuple[str, str]] = set()
@@ -1372,7 +1541,7 @@ def _sync_tenant_body(
 
     if sync_mdr and firewalls_list:
         if progress is not None:
-            progress.update("MDR threat feed", 8)
+            progress.update("MDR threat feed", 10)
         t0 = time.perf_counter()
         for fw in firewalls_list:
             _sync_mdr_threat_feed_for_firewall(
@@ -1512,7 +1681,7 @@ def sync_client_credentials_to_database(
 def parse_args():
     p = argparse.ArgumentParser(
         prog="central-sync-to-db",
-        description="Sync Sophos Central tenants, firewalls, groups, licenses, alerts, and firmware info to SQLite",
+        description="Sync Sophos Central tenants, roles, admins, firewalls, groups, licenses, alerts, and firmware to SQLite",
     )
     p.add_argument(
         "-l",

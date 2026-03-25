@@ -92,6 +92,8 @@ _RUN_SUMMARY_TABLES = (
     "firewall_groups",
     "firewall_group_sync_status",
     "mdr_threat_feed_sync",
+    "tenant_roles",
+    "tenant_admins",
 )
 _RUN_SUMMARY_QUERIES = {
     "tenants": (
@@ -137,6 +139,14 @@ _RUN_SUMMARY_QUERIES = {
     "mdr_threat_feed_sync": (
         "SELECT COUNT(*) FROM mdr_threat_feed_sync WHERE sync_id = ? AND first_sync = last_sync",
         "SELECT COUNT(*) FROM mdr_threat_feed_sync WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "tenant_roles": (
+        "SELECT COUNT(*) FROM tenant_roles WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM tenant_roles WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
+    ),
+    "tenant_admins": (
+        "SELECT COUNT(*) FROM tenant_admins WHERE sync_id = ? AND first_sync = last_sync",
+        "SELECT COUNT(*) FROM tenant_admins WHERE sync_id = ? AND (first_sync IS NULL OR first_sync != last_sync)",
     ),
 }
 
@@ -391,6 +401,44 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS ix_mdr_threat_feed_tenant_id ON mdr_threat_feed_sync(tenant_id);
 
+        CREATE TABLE IF NOT EXISTS tenant_roles (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT,
+            description TEXT,
+            role_type TEXT,
+            principal_type TEXT,
+            permission_sets_json TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            client_id TEXT,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tenant_roles_tenant_id ON tenant_roles(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS tenant_admins (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            tenant_ref_json TEXT,
+            profile_name TEXT,
+            profile_first_name TEXT,
+            profile_last_name TEXT,
+            profile_email TEXT,
+            users_json TEXT,
+            role_assignments_json TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            first_sync TEXT,
+            last_sync TEXT,
+            sync_id TEXT,
+            client_id TEXT,
+            FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tenant_admins_tenant_id ON tenant_admins(tenant_id);
+
         CREATE TABLE IF NOT EXISTS sync_change_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sync_id TEXT NOT NULL,
@@ -433,6 +481,8 @@ def _migrate_sync_columns(conn: sqlite3.Connection) -> None:
         "firewall_groups",
         "firewall_group_sync_status",
         "mdr_threat_feed_sync",
+        "tenant_roles",
+        "tenant_admins",
     ):
         cur = conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
@@ -455,6 +505,8 @@ def _drop_synced_at_column(conn: sqlite3.Connection) -> None:
         "firewall_groups",
         "firewall_group_sync_status",
         "mdr_threat_feed_sync",
+        "tenant_roles",
+        "tenant_admins",
     ):
         cur = conn.execute(f"PRAGMA table_info({table})")
         if any(row[1] == "synced_at" for row in cur.fetchall()):
@@ -477,6 +529,8 @@ def _ensure_sync_columns(conn: sqlite3.Connection) -> None:
         "firewall_groups",
         "firewall_group_sync_status",
         "mdr_threat_feed_sync",
+        "tenant_roles",
+        "tenant_admins",
     ):
         if not _table_exists(conn, table):
             continue
@@ -503,6 +557,8 @@ def _ensure_client_id_column(conn: sqlite3.Connection) -> None:
         "firewall_groups",
         "firewall_group_sync_status",
         "mdr_threat_feed_sync",
+        "tenant_roles",
+        "tenant_admins",
     ):
         if not _table_exists(conn, table):
             continue
@@ -846,6 +902,70 @@ def delete_stale_firewall_groups_for_tenant(
         "firewall_groups",
         f"SELECT * FROM firewall_groups WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
         f"DELETE FROM firewall_groups WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        params,
+        lambda r: {"id": r["id"]},
+    )
+
+
+def delete_stale_tenant_roles_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    if not keep_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "tenant_roles",
+            "SELECT * FROM tenant_roles WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM tenant_roles WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"id": r["id"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_ids))
+    params = (client_id, tenant_id, *tuple(keep_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "tenant_roles",
+        f"SELECT * FROM tenant_roles WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        f"DELETE FROM tenant_roles WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        params,
+        lambda r: {"id": r["id"]},
+    )
+
+
+def delete_stale_tenant_admins_for_tenant(
+    conn: sqlite3.Connection,
+    *,
+    client_id: str,
+    tenant_id: str,
+    keep_ids: set[str],
+    api_ok: bool,
+) -> None:
+    if not api_ok:
+        return
+    if not keep_ids:
+        _delete_rows_with_change_log(
+            conn,
+            "tenant_admins",
+            "SELECT * FROM tenant_admins WHERE client_id = ? AND tenant_id = ?",
+            "DELETE FROM tenant_admins WHERE client_id = ? AND tenant_id = ?",
+            (client_id, tenant_id),
+            lambda r: {"id": r["id"]},
+        )
+        return
+    ph = ",".join("?" * len(keep_ids))
+    params = (client_id, tenant_id, *tuple(keep_ids))
+    _delete_rows_with_change_log(
+        conn,
+        "tenant_admins",
+        f"SELECT * FROM tenant_admins WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
+        f"DELETE FROM tenant_admins WHERE client_id = ? AND tenant_id = ? AND id NOT IN ({ph})",
         params,
         lambda r: {"id": r["id"]},
     )
@@ -1828,6 +1948,136 @@ def upsert_firewall_group_sync_status(
             old,
             new,
         )
+
+
+def upsert_tenant_role(
+    conn: sqlite3.Connection,
+    role: Any,
+    *,
+    tenant_id: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Persist a role from ``get_roles`` (object with API-shaped attributes or dict)."""
+    rid = _get(role, "id") or "unknown"
+    old = (
+        conn.execute("SELECT * FROM tenant_roles WHERE id = ?", (rid,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
+    perm = _get(role, "permissionSets")
+    row = (
+        rid,
+        tenant_id,
+        _get(role, "name"),
+        _get(role, "description"),
+        _get(role, "type"),
+        _get(role, "principalType"),
+        _to_json(perm if perm is not None else []),
+        _scalar_text(_get(role, "createdAt")),
+        _scalar_text(_get(role, "updatedAt")),
+        run_timestamp,
+        run_timestamp,
+        update_id,
+        client_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO tenant_roles (
+            id, tenant_id, name, description, role_type, principal_type,
+            permission_sets_json, created_at, updated_at,
+            first_sync, last_sync, sync_id, client_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            name = excluded.name,
+            description = excluded.description,
+            role_type = excluded.role_type,
+            principal_type = excluded.principal_type,
+            permission_sets_json = excluded.permission_sets_json,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
+        """,
+        row,
+    )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM tenant_roles WHERE id = ?", (rid,)
+        ).fetchone()
+        log_data_row_changes(conn, "tenant_roles", {"id": rid}, old, new)
+
+
+def upsert_tenant_admin(
+    conn: sqlite3.Connection,
+    admin: Any,
+    *,
+    tenant_id: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+) -> None:
+    """Persist an admin from ``get_admins``."""
+    aid = _get(admin, "id") or "unknown"
+    old = (
+        conn.execute("SELECT * FROM tenant_admins WHERE id = ?", (aid,)).fetchone()
+        if _sync_change_ctx.get()
+        else None
+    )
+    tenant_ref = _get(admin, "tenant")
+    profile = _get(admin, "profile") or {}
+    users = _get(admin, "users")
+    ra = _get(admin, "roleAssignments")
+    row = (
+        aid,
+        tenant_id,
+        _to_json(tenant_ref),
+        _get(profile, "name"),
+        _get(profile, "firstName"),
+        _get(profile, "lastName"),
+        _get(profile, "email"),
+        _to_json(users if users is not None else []),
+        _to_json(ra if ra is not None else []),
+        _scalar_text(_get(admin, "createdAt")),
+        _scalar_text(_get(admin, "updatedAt")),
+        run_timestamp,
+        run_timestamp,
+        update_id,
+        client_id,
+    )
+    conn.execute(
+        """
+        INSERT INTO tenant_admins (
+            id, tenant_id, tenant_ref_json, profile_name, profile_first_name,
+            profile_last_name, profile_email, users_json, role_assignments_json,
+            created_at, updated_at,
+            first_sync, last_sync, sync_id, client_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            tenant_id = excluded.tenant_id,
+            tenant_ref_json = excluded.tenant_ref_json,
+            profile_name = excluded.profile_name,
+            profile_first_name = excluded.profile_first_name,
+            profile_last_name = excluded.profile_last_name,
+            profile_email = excluded.profile_email,
+            users_json = excluded.users_json,
+            role_assignments_json = excluded.role_assignments_json,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            last_sync = excluded.last_sync,
+            sync_id = excluded.sync_id,
+            client_id = excluded.client_id
+        """,
+        row,
+    )
+    if _sync_change_ctx.get():
+        new = conn.execute(
+            "SELECT * FROM tenant_admins WHERE id = ?", (aid,)
+        ).fetchone()
+        log_data_row_changes(conn, "tenant_admins", {"id": aid}, old, new)
 
 
 def upsert_mdr_threat_feed_sync(
