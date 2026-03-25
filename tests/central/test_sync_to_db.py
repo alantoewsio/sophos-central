@@ -18,7 +18,6 @@ from central.sync_to_db import (
     SyncProgress,
     _cred_sources_from_args,
     _format_duration,
-    _from_time_after,
     _progress_erase_prefix,
     _quiet_sync_cli_loggers,
     _sync_mdr_threat_feed_for_firewall,
@@ -53,17 +52,6 @@ _SUMMARY_TABLE_KEYS = (
 def test_format_duration():
     assert "ms" in _format_duration(0.5)
     assert "s" in _format_duration(2.0)
-
-
-def test_from_time_after_ok_and_bad():
-    assert _from_time_after("2024-01-01T00:00:00Z") is not None
-    assert _from_time_after("not-a-date") is None
-
-
-@patch("central.sync_to_db.logger")
-def test_from_time_after_warning_on_parse_error(mock_log):
-    assert _from_time_after("bad") is None
-    mock_log.warning.assert_called_once()
 
 
 def test_get_creds_from_env_file(tmp_path: Path):

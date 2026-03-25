@@ -18,7 +18,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -376,21 +376,6 @@ class SyncProgress:
         else:
             sys.stdout.write(erase)
         sys.stdout.flush()
-
-
-def _from_time_after(latest_raised_at: str) -> str | None:
-    """Return an ISO 8601 datetime 1 second after latest_raised_at, or None on parse error."""
-    try:
-        ts = latest_raised_at.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
-        next_dt = dt + timedelta(seconds=1)
-        return next_dt.isoformat().replace("+00:00", "Z")
-    except (ValueError, TypeError):
-        logger.warning(
-            "Could not parse latest alert raised_at %r, syncing all alerts",
-            latest_raised_at,
-        )
-        return None
 
 
 def ensure_tenant_record(
@@ -765,7 +750,9 @@ def _sync_partner_body(
         from_time = None
         latest_raised = get_latest_alert_raised_at(conn, tenant.id)
         if latest_raised:
-            from_time = _from_time_after(latest_raised)
+            # Use exact MAX(raised_at): API filter is "on or after". Adding a fixed
+            # delta (e.g. +1s) skipped alerts with raisedAt still before that bound.
+            from_time = latest_raised
             logger.debug("Tenant %s: syncing alerts from %s", tenant.id, from_time)
         t0 = time.perf_counter()
         alerts_result = get_alerts(
@@ -1322,7 +1309,7 @@ def _sync_tenant_body(
     from_time = None
     latest_raised = get_latest_alert_raised_at(conn, whoami.id)
     if latest_raised:
-        from_time = _from_time_after(latest_raised)
+        from_time = latest_raised
         logger.debug("Syncing alerts from %s", from_time)
     t0 = time.perf_counter()
     alerts_result = get_alerts(
