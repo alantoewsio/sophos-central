@@ -1,12 +1,33 @@
 """Tests for central.alerts.classes."""
 
-from central.alerts.classes import Alert, Alerts, ManagedAgent, Person, TenantRef
+from central.alerts.classes import (
+    Alert,
+    AlertActionResult,
+    Alerts,
+    ManagedAgent,
+    Person,
+    TenantRef,
+)
 
 
 def test_managed_agent_person_tenant_ref():
     assert ManagedAgent({}).id == ""
     assert Person({"id": "p"}).name is None
     assert TenantRef({}).id == ""
+
+
+def test_alert_action_result():
+    r = AlertActionResult(
+        {
+            "id": "i",
+            "alertId": "a",
+            "action": "acknowledge",
+            "status": "completed",
+            "requestedAt": "t0",
+            "completedAt": "t1",
+        }
+    )
+    assert r.id == "i" and r.alertId == "a" and r.completedAt == "t1"
 
 
 def test_alert_and_alerts():

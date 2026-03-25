@@ -57,6 +57,18 @@ class Alert:
         self.type = data.get("type", "")
 
 
+class AlertActionResult:
+    """Response from POST /common/v1/alerts/{alertId}/actions (201)."""
+
+    def __init__(self, data: dict):
+        self.id = data.get("id", "")
+        self.alertId = data.get("alertId", "")
+        self.action = data.get("action", "")
+        self.status = data.get("status", "")
+        self.requestedAt = data.get("requestedAt", "")
+        self.completedAt = data.get("completedAt")
+
+
 class Alerts(CentralItems[Alert]):
     def get_alert_by_id(self, id: str) -> Alert | None:
         return self.get_item_by_attr("id", id)
