@@ -21,6 +21,7 @@ from central.sync_to_db import (
     _progress_erase_prefix,
     _quiet_sync_cli_loggers,
     _sync_mdr_threat_feed_for_firewall,
+    _sync_tenant_firewalls_alerts_and_details,
     _try_enable_windows_console_vt,
     ensure_tenant_record,
     export_db_to_xlsx,
@@ -28,8 +29,11 @@ from central.sync_to_db import (
     get_creds_from_env_file,
     parse_args,
     sync_client_credentials_to_database,
+    sync_client_credentials_to_database_incremental,
     sync_partner,
+    sync_partner_incremental,
     sync_tenant,
+    sync_tenant_incremental,
 )
 
 _SUMMARY_TABLE_KEYS = (
@@ -682,6 +686,297 @@ def test_sync_client_credentials_partner(mock_uuid, mock_sp, mock_st, db_conn):
         )
 
 
+@patch("central.sync_to_db.sync_tenant_incremental")
+@patch("central.sync_to_db.sync_partner_incremental")
+@patch("central.sync_to_db.uuid.uuid4")
+def test_sync_client_credentials_incremental_routing(
+    mock_uuid, mock_spi, mock_sti, db_conn
+):
+    mock_uuid.return_value = SimpleNamespace(hex="c" * 32)
+    central = MagicMock()
+    central.authenticate.return_value = SimpleNamespace(success=True)
+    central.whoami = SimpleNamespace(idType="partner", id="p")
+    with patch("central.sync_to_db.CentralSession", return_value=central):
+        r = sync_client_credentials_to_database_incremental(
+            db_conn, "id", "sec", quiet=True, progress=None
+        )
+    assert isinstance(r, CredentialsSyncResult)
+    mock_spi.assert_called_once()
+    mock_sti.assert_not_called()
+    central.whoami = SimpleNamespace(idType="tenant", id="t")
+    with patch("central.sync_to_db.CentralSession", return_value=central):
+        sync_client_credentials_to_database_incremental(
+            db_conn, "id", "sec", quiet=True, progress=None
+        )
+    assert mock_sti.call_count == 1
+
+
+@patch("central.sync_to_db.CentralSession")
+def test_sync_client_credentials_incremental_auth_fail(mock_cs, db_conn):
+    mock_cs.return_value.authenticate.return_value = SimpleNamespace(
+        success=False, message="bad"
+    )
+    with pytest.raises(CentralSyncAuthError):
+        sync_client_credentials_to_database_incremental(db_conn, "a", "b", quiet=True)
+
+
+@patch("central.sync_to_db.CentralSession")
+def test_sync_client_credentials_incremental_quiet_false(mock_cs, db_conn):
+    mock_cs.return_value.authenticate.return_value = SimpleNamespace(success=True)
+    mock_cs.return_value.whoami = SimpleNamespace(idType="tenant", id="tid")
+    with patch("central.sync_to_db.sync_tenant_incremental"):
+        sync_client_credentials_to_database_incremental(
+            db_conn, "a", "b", quiet=False, progress=None
+        )
+
+
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_partner_incremental_minimal(
+    mock_gfw, mock_alerts, mock_get_alert, db_conn
+):
+    mock_gfw.return_value = ReturnState(success=False, message="x")
+    mock_alerts.return_value = ReturnState(success=False, message="x")
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    central.get_tenants.return_value = ReturnState(success=False, message="no tenants")
+    sync_partner_incremental(
+        db_conn,
+        central,
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+        progress=None,
+    )
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = []
+    mock_alerts.return_value = []
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]), patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ):
+        sync_partner_incremental(
+            db_conn,
+            central,
+            client_id="oauth-cid",
+            update_id="u2",
+            run_timestamp="ts",
+            elapsed_by_table={},
+            progress=SyncProgress(),
+        )
+
+
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_partner_incremental_alert_details(
+    mock_gfw, mock_alerts, mock_get_alert, db_conn
+):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = []
+    mock_alerts.return_value = [SimpleNamespace(id="a1")]
+    mock_get_alert.return_value = {"id": "a1", "category": "c"}
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=["a1"]), patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ):
+        sync_partner_incremental(
+            db_conn,
+            central,
+            client_id="oauth-cid",
+            update_id="ud",
+            run_timestamp="ts",
+            progress=None,
+        )
+
+
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_tenant_incremental(mock_gfw, mock_alerts, mock_get_alert, db_conn):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(
+        id="t1", data_region_url=lambda: "https://h/"
+    )
+    mock_gfw.return_value = []
+    mock_alerts.return_value = []
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]), patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ):
+        sync_tenant_incremental(
+            db_conn,
+            central,
+            client_id="oauth-cid",
+            update_id="u",
+            run_timestamp="ts",
+            progress=SyncProgress(),
+        )
+
+
+@patch("central.sync_to_db.get_firewalls", return_value=[])
+@patch("central.sync_to_db.get_alerts", return_value=ReturnState(success=False, message="e"))
+@patch("central.sync_to_db.get_new_alert_ids", return_value=[])
+@patch(
+    "central.sync_to_db.get_latest_alert_raised_at",
+    return_value=None,
+)
+def test_sync_tenant_firewalls_alerts_and_details_branch_failures(
+    mock_gfw, mock_alerts, mock_new, mock_latest, db_conn
+):
+    central = MagicMock()
+    elapsed = {}
+    _sync_tenant_firewalls_alerts_and_details(
+        db_conn,
+        central,
+        tenant_id="t1",
+        url_base="https://h/",
+        tenant_display_name="TD",
+        client_id="c",
+        update_id="u",
+        run_timestamp="ts",
+        elapsed_by_table=elapsed,
+        progress=None,
+        progress_label_prefix="",
+        progress_first_step=None,
+    )
+    mock_gfw.return_value = ReturnState(success=False, message="fw")
+    _sync_tenant_firewalls_alerts_and_details(
+        db_conn,
+        central,
+        tenant_id="t2",
+        url_base="https://h/",
+        tenant_display_name="TD",
+        client_id="c",
+        update_id="u",
+        run_timestamp="ts",
+        elapsed_by_table=elapsed,
+        progress=None,
+        progress_label_prefix="",
+        progress_first_step=None,
+    )
+
+
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts", return_value=[])
+@patch("central.sync_to_db.get_firewalls", return_value=[])
+@patch("central.sync_to_db.get_new_alert_ids", return_value=[])
+def test_sync_tenant_firewalls_alerts_and_details_with_progress(
+    mock_new, mock_gfw, mock_alerts, mock_get_alert, db_conn
+):
+    central = MagicMock()
+    sp = SyncProgress()
+    sp._visible = False
+    with patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ):
+        _sync_tenant_firewalls_alerts_and_details(
+            db_conn,
+            central,
+            tenant_id="t1",
+            url_base="https://h/",
+            tenant_display_name="TD",
+            client_id="c",
+            update_id="u",
+            run_timestamp="ts",
+            elapsed_by_table={},
+            progress=sp,
+            progress_label_prefix="P: ",
+            progress_first_step=0,
+        )
+
+
+def test_sync_tenant_firewalls_alerts_and_details_firewalls_api_failed(db_conn):
+    central = MagicMock()
+    with patch(
+        "central.sync_to_db.get_firewalls",
+        return_value=ReturnState(success=False, message="fwfail"),
+    ), patch("central.sync_to_db.get_alerts", return_value=[]), patch(
+        "central.sync_to_db.get_new_alert_ids", return_value=[]
+    ), patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None):
+        _sync_tenant_firewalls_alerts_and_details(
+            db_conn,
+            central,
+            tenant_id="t1",
+            url_base="https://h/",
+            tenant_display_name="TD",
+            client_id="c",
+            update_id="u",
+            run_timestamp="ts",
+            elapsed_by_table={},
+            progress=None,
+            progress_label_prefix="",
+            progress_first_step=None,
+        )
+
+
+def test_sync_tenant_firewalls_alerts_and_details_success_rows_and_details(
+    db_conn,
+):
+    central = MagicMock()
+    sp = SyncProgress()
+    sp._visible = False
+    with patch(
+        "central.sync_to_db.get_latest_alert_raised_at",
+        return_value="2024-06-01T00:00:00Z",
+    ), patch(
+        "central.sync_to_db.get_new_alert_ids", return_value=["a1", "a2"]
+    ), patch(
+        "central.sync_to_db.get_firewalls",
+        return_value=[
+            SimpleNamespace(
+                id="fw1",
+                serialNumber="sn",
+                tenant=SimpleNamespace(id="t1"),
+                group=None,
+                status=None,
+            )
+        ],
+    ), patch("central.sync_to_db.get_alerts", return_value=[]), patch(
+        "central.sync_to_db.get_alert",
+        side_effect=[
+            SimpleNamespace(id="a1"),
+            ReturnState(success=False, message="d2"),
+        ],
+    ):
+        _sync_tenant_firewalls_alerts_and_details(
+            db_conn,
+            central,
+            tenant_id="t1",
+            url_base="https://h/",
+            tenant_display_name="TD",
+            client_id="c",
+            update_id="u",
+            run_timestamp="ts",
+            elapsed_by_table={},
+            progress=sp,
+            progress_label_prefix="",
+            progress_first_step=0,
+        )
+
+
+def test_sync_tenant_incremental_default_elapsed_and_progress(db_conn):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(
+        id="t1", data_region_url=lambda: "https://h/"
+    )
+    prog = MagicMock()
+    with patch("central.sync_to_db._sync_tenant_firewalls_alerts_and_details"):
+        sync_tenant_incremental(
+            db_conn,
+            central,
+            client_id="oauth-cid",
+            update_id="u",
+            run_timestamp="ts",
+            elapsed_by_table=None,
+            progress=prog,
+        )
+    prog.set_total.assert_called_once_with(4)
+    prog.update.assert_any_call("Tenant record", 0)
+
+
 @patch("central.sync_to_db.CentralSession")
 def test_sync_client_credentials_auth_fail(mock_cs, db_conn):
     mock_cs.return_value.authenticate.return_value = SimpleNamespace(
@@ -697,6 +992,8 @@ def test_parse_args():
         assert a.db == Path("x.db")
     with patch.object(sys, "argv", ["prog", "--db", "x.db", "--mdr"]):
         assert parse_args().mdr is True
+    with patch.object(sys, "argv", ["prog", "--db", "x.db", "--incremental"]):
+        assert parse_args().incremental is True
 
 
 @patch("central.sync_to_db.sync_client_credentials_to_database")
@@ -719,6 +1016,32 @@ def test_main_happy_path(mock_cs, mock_cfg, mock_init, mock_conn, mock_sync, tmp
         from central.sync_to_db import main
 
         main()
+    mock_conn.return_value.close.assert_called()
+
+
+@patch("central.sync_to_db.sync_client_credentials_to_database_incremental")
+@patch("central.sync_to_db.get_connection")
+@patch("central.sync_to_db.init_schema")
+@patch("central.sync_to_db.configure_logging")
+@patch("central.sync_to_db._cred_sources_from_args")
+def test_main_happy_path_incremental(
+    mock_cred_src, mock_cfg, mock_init, mock_conn, mock_sync_inc, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    dbf = tmp_path / "d.db"
+    mock_conn.return_value = MagicMock()
+    mock_cred_src.return_value = [("a", "b")]
+    mock_sync_inc.return_value = CredentialsSyncResult(
+        "sid",
+        {k: {"added": 0, "updated": 0} for k in _SUMMARY_TABLE_KEYS},
+        {k: 0.0 for k in _SUMMARY_TABLE_KEYS},
+        1.0,
+    )
+    with patch.object(sys, "argv", ["prog", "--db", str(dbf), "--incremental"]):
+        from central.sync_to_db import main
+
+        main()
+    mock_sync_inc.assert_called_once()
     mock_conn.return_value.close.assert_called()
 
 

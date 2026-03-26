@@ -1566,6 +1566,313 @@ def _sync_tenant_body(
     )
 
 
+def _sync_tenant_firewalls_alerts_and_details(
+    conn: sqlite3.Connection,
+    central: CentralSession,
+    *,
+    tenant_id: str,
+    url_base: str,
+    tenant_display_name: str,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float],
+    progress: SyncProgress | None = None,
+    progress_label_prefix: str = "",
+    progress_first_step: int | None = None,
+) -> None:
+    """Firewalls, incremental alerts (from latest cached ``raised_at``), and details for new alerts only.
+
+    Used by full partner/tenant sync and by :func:`sync_partner_incremental` / :func:`sync_tenant_incremental`.
+    When ``progress`` is set, ``progress_first_step`` must be the step index for the firewalls sub-step
+    (alerts and details use ``progress_first_step + 1`` and ``+ 2``).
+    """
+    lbl = progress_label_prefix
+
+    if progress is not None:
+        assert progress_first_step is not None
+        progress.update(f"{lbl}Firewalls", progress_first_step)
+    t0 = time.perf_counter()
+    firewalls: list = []
+    firewalls_result = get_firewalls(
+        central,
+        tenant_id=tenant_id,
+        url_base=url_base,
+    )
+    if isinstance(firewalls_result, ReturnState) and not firewalls_result.success:
+        logger.warning(
+            "Firewalls for tenant %s (%s): %s",
+            tenant_display_name,
+            tenant_id,
+            firewalls_result.message,
+        )
+    else:
+        firewalls = list(firewalls_result)
+        for fw in firewalls:
+            upsert_firewall(
+                conn,
+                fw,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+    elapsed = time.perf_counter() - t0
+    elapsed_by_table["firewalls"] = elapsed_by_table.get("firewalls", 0) + elapsed
+    logger.info(
+        "Tenant %s: %d firewalls synced (%s)",
+        tenant_display_name,
+        len(firewalls),
+        _format_duration(elapsed),
+    )
+    firewalls_api_ok = not (
+        isinstance(firewalls_result, ReturnState) and not firewalls_result.success
+    )
+    delete_stale_firewalls_for_tenant(
+        conn,
+        client_id=client_id,
+        tenant_id=tenant_id,
+        keep_ids={fw.id for fw in firewalls},
+        api_ok=firewalls_api_ok,
+    )
+
+    if progress is not None:
+        progress.update(f"{lbl}Alerts", progress_first_step + 1)
+    from_time = None
+    latest_raised = get_latest_alert_raised_at(conn, tenant_id)
+    if latest_raised:
+        from_time = latest_raised
+        logger.debug("Tenant %s: syncing alerts from %s", tenant_id, from_time)
+    t0 = time.perf_counter()
+    alerts_result = get_alerts(
+        central,
+        tenant_id=tenant_id,
+        url_base=url_base,
+        product=["firewall", "other"],
+        from_time=from_time,
+    )
+    if isinstance(alerts_result, ReturnState) and not alerts_result.success:
+        logger.warning(
+            "Alerts for tenant %s (%s): %s",
+            tenant_display_name,
+            tenant_id,
+            alerts_result.message,
+        )
+    else:
+        for alert in alerts_result:
+            upsert_alert(
+                conn,
+                alert,
+                client_id=client_id,
+                tenant_id=tenant_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+            )
+    elapsed = time.perf_counter() - t0
+    elapsed_by_table["alerts"] = elapsed_by_table.get("alerts", 0) + elapsed
+    logger.info(
+        "Tenant %s: %d alerts synced (%s)",
+        tenant_display_name,
+        len(alerts_result) if not isinstance(alerts_result, ReturnState) else 0,
+        _format_duration(elapsed),
+    )
+
+    new_alert_ids = get_new_alert_ids(conn, update_id, tenant_id)
+    if progress is not None and not new_alert_ids:
+        progress.update(f"{lbl}Alert details", progress_first_step + 2)
+    if new_alert_ids:
+        n_alert_details = len(new_alert_ids)
+        t0_details = time.perf_counter()
+        for i, aid in enumerate(new_alert_ids, start=1):
+            if progress is not None:
+                progress.update(
+                    f"{lbl}Alert details ({i}/{n_alert_details})",
+                    progress_first_step + 2,
+                )
+            detail_result = get_alert(
+                central,
+                aid,
+                tenant_id=tenant_id,
+                url_base=url_base,
+            )
+            if not isinstance(detail_result, ReturnState) and detail_result:
+                upsert_alert_detail(
+                    conn,
+                    detail_result,
+                    client_id=client_id,
+                    tenant_id=tenant_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+        elapsed_d = time.perf_counter() - t0_details
+        elapsed_by_table["alert_details"] = elapsed_by_table.get(
+            "alert_details", 0
+        ) + elapsed_d
+        logger.info(
+            "Tenant %s: %d alert details synced",
+            tenant_display_name,
+            len(new_alert_ids),
+        )
+
+
+def sync_partner_incremental(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float] | None = None,
+    progress: SyncProgress | None = None,
+) -> None:
+    """Partner sync: tenants list plus firewalls, incremental alerts, and alert details only."""
+    if elapsed_by_table is None:
+        elapsed_by_table = {}
+    with sync_change_logging(update_id, client_id, run_timestamp):
+        _sync_partner_incremental_body(
+            conn,
+            central,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            elapsed_by_table=elapsed_by_table,
+            progress=progress,
+        )
+
+
+def _sync_partner_incremental_body(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float],
+    progress: SyncProgress | None,
+) -> None:
+    tenants_result = central.get_tenants()
+    tenants_api_ok = not (
+        isinstance(tenants_result, ReturnState) and not tenants_result.success
+    )
+    if isinstance(tenants_result, ReturnState) and not tenants_result.success:
+        logger.warning("Could not fetch tenants: %s", tenants_result.message)
+        tenants = []
+    else:
+        tenants = list(tenants_result)
+    tenant_ids_seen = {t.id for t in tenants}
+
+    steps_per_tenant = 3
+    total_steps = len(tenants) * steps_per_tenant
+    if progress is not None:
+        progress.set_total(total_steps)
+
+    logger.info("Incremental sync: %d tenants", len(tenants))
+    step = 0
+    for tenant in tenants:
+        t0 = time.perf_counter()
+        upsert_tenant(
+            conn,
+            tenant,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+        )
+        elapsed_by_table["tenants"] = elapsed_by_table.get("tenants", 0) + (
+            time.perf_counter() - t0
+        )
+        logger.debug("Tenant upserted: %s (%s)", tenant.name, tenant.id)
+
+        prefix = f"Tenant {tenant.name!r}: "
+        _sync_tenant_firewalls_alerts_and_details(
+            conn,
+            central,
+            tenant_id=tenant.id,
+            url_base=tenant.apiHost,
+            tenant_display_name=tenant.name,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            elapsed_by_table=elapsed_by_table,
+            progress=progress,
+            progress_label_prefix=prefix,
+            progress_first_step=step,
+        )
+        step += steps_per_tenant
+
+    delete_stale_tenants_for_partner(
+        conn,
+        client_id=client_id,
+        keep_tenant_ids=tenant_ids_seen,
+        api_ok=tenants_api_ok,
+    )
+
+
+def sync_tenant_incremental(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float] | None = None,
+    progress: SyncProgress | None = None,
+) -> None:
+    """Tenant credential sync: firewalls, incremental alerts, and alert details only."""
+    if elapsed_by_table is None:
+        elapsed_by_table = {}
+    with sync_change_logging(update_id, client_id, run_timestamp):
+        _sync_tenant_incremental_body(
+            conn,
+            central,
+            client_id=client_id,
+            update_id=update_id,
+            run_timestamp=run_timestamp,
+            elapsed_by_table=elapsed_by_table,
+            progress=progress,
+        )
+
+
+def _sync_tenant_incremental_body(
+    conn,
+    central: CentralSession,
+    *,
+    client_id: str,
+    update_id: str,
+    run_timestamp: str,
+    elapsed_by_table: dict[str, float],
+    progress: SyncProgress | None,
+) -> None:
+    whoami = central.whoami
+    url_base = whoami.data_region_url()
+    if progress is not None:
+        progress.set_total(4)
+        progress.update("Tenant record", 0)
+    t0 = time.perf_counter()
+    ensure_tenant_record(
+        conn,
+        whoami.id,
+        name=whoami.id,
+        client_id=client_id,
+        update_id=update_id,
+        run_timestamp=run_timestamp,
+    )
+    elapsed_by_table["tenants"] = time.perf_counter() - t0
+
+    _sync_tenant_firewalls_alerts_and_details(
+        conn,
+        central,
+        tenant_id=whoami.id,
+        url_base=url_base,
+        tenant_display_name=whoami.id,
+        client_id=client_id,
+        update_id=update_id,
+        run_timestamp=run_timestamp,
+        elapsed_by_table=elapsed_by_table,
+        progress=progress,
+        progress_label_prefix="",
+        progress_first_step=1,
+    )
+
+
 @contextmanager
 def _quiet_sync_cli_loggers(quiet: bool):
     """When quiet, swallow central.* logs (including this module) so nothing reaches root/stderr."""
@@ -1665,6 +1972,76 @@ def sync_client_credentials_to_database(
     )
 
 
+def sync_client_credentials_to_database_incremental(
+    conn: sqlite3.Connection,
+    client_id: str,
+    client_secret: str,
+    *,
+    quiet: bool = True,
+    progress: SyncProgress | None = None,
+) -> CredentialsSyncResult:
+    """
+    Incremental sync: firewalls, alerts (from last cached ``raised_at`` per tenant), and alert
+    details for alerts new in this run only. Does not touch licenses, roles/admins, firmware,
+    firewall groups, or MDR.
+
+    Same credentials and result shape as :func:`sync_client_credentials_to_database`.
+    """
+    client_id, client_secret = client_id.strip(), client_secret.strip()
+    use_progress = None if quiet else progress
+
+    with _quiet_sync_cli_loggers(quiet):
+        if not quiet:
+            logger.info("Authenticating with Sophos Central (incremental sync)")
+        central = CentralSession(client_id, client_secret)
+        auth_result = central.authenticate()
+        if not auth_result.success:
+            raise CentralSyncAuthError(auth_result.message or "Authentication failed")
+        if not quiet:
+            logger.info(
+                "Authenticated as %s '%s'",
+                central.whoami.idType,
+                central.whoami.id,
+            )
+
+        update_id = uuid.uuid4().hex
+        run_timestamp = _now_utc()
+        sync_start = time.perf_counter()
+        elapsed_by_table: dict[str, float] = {t: 0.0 for t in SUMMARY_TABLES}
+
+        if central.whoami.idType == "partner":
+            sync_partner_incremental(
+                conn,
+                central,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                elapsed_by_table=elapsed_by_table,
+                progress=use_progress,
+            )
+        else:
+            sync_tenant_incremental(
+                conn,
+                central,
+                client_id=client_id,
+                update_id=update_id,
+                run_timestamp=run_timestamp,
+                elapsed_by_table=elapsed_by_table,
+                progress=use_progress,
+            )
+
+        total_elapsed = time.perf_counter() - sync_start
+        conn.commit()
+        summary = get_run_summary(conn, update_id)
+
+    return CredentialsSyncResult(
+        sync_id=update_id,
+        summary=summary,
+        elapsed_by_table=elapsed_by_table,
+        total_elapsed=total_elapsed,
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         prog="central-sync-to-db",
@@ -1724,7 +2101,15 @@ def parse_args():
         action="store_true",
         help=(
             "After firewall groups, request MDR threat feed per firewall and poll transactions "
-            "(slow; can add minutes per firewall)."
+            "(slow; can add minutes per firewall). Ignored with --incremental."
+        ),
+    )
+    p.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Only sync firewalls, alerts (from last cached raised_at per tenant), and alert "
+            "details for new alerts. Skips licenses, roles, admins, firmware, groups, and MDR."
         ),
     )
     return p.parse_args()
@@ -1757,14 +2142,23 @@ def main() -> None:
             if len(sources) > 1:
                 logger.info("Sync run %s", run_label)
             try:
-                result = sync_client_credentials_to_database(
-                    conn,
-                    client_id,
-                    client_secret,
-                    quiet=False,
-                    progress=progress,
-                    sync_mdr=args.mdr,
-                )
+                if args.incremental:
+                    result = sync_client_credentials_to_database_incremental(
+                        conn,
+                        client_id,
+                        client_secret,
+                        quiet=False,
+                        progress=progress,
+                    )
+                else:
+                    result = sync_client_credentials_to_database(
+                        conn,
+                        client_id,
+                        client_secret,
+                        quiet=False,
+                        progress=progress,
+                        sync_mdr=args.mdr,
+                    )
             except CentralSyncAuthError as e:
                 logger.error("Authentication failed: %s", e.message)
                 raise SystemExit(1)
