@@ -793,10 +793,68 @@ def test_sync_partner_incremental_alert_details(
         )
 
 
+@patch("central.sync_to_db.firmware_upgrade_check")
 @patch("central.sync_to_db.get_alert")
 @patch("central.sync_to_db.get_alerts")
 @patch("central.sync_to_db.get_firewalls")
-def test_sync_tenant_incremental(mock_gfw, mock_alerts, mock_get_alert, db_conn):
+def test_sync_partner_incremental_firmware_aggregate_and_prune(
+    mock_gfw, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+):
+    """Incremental partner sync merges firmware_versions for client-wide prune."""
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True,
+        firewalls=[
+            SimpleNamespace(
+                id="fw1",
+                serialNumber="sn1",
+                firmwareVersion="v0",
+                upgradeToVersion="v1",
+            )
+        ],
+        firmwareVersions=[SimpleNamespace(version="v9", size="1", bugs=[], news=[])],
+    )
+    central = MagicMock()
+    central.whoami = SimpleNamespace(id="p1")
+    tenant = SimpleNamespace(id="t1", name="T", apiHost="https://h/")
+    central.get_tenants.return_value = [tenant]
+    mock_gfw.return_value = [
+        SimpleNamespace(
+            id="fw1",
+            serialNumber="sn",
+            tenant=SimpleNamespace(id="t1"),
+            group=None,
+            status=None,
+        )
+    ]
+    mock_alerts.return_value = []
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]), patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ), patch(
+        "central.sync_to_db.delete_stale_firmware_versions_for_client"
+    ) as mock_del_ver:
+        sync_partner_incremental(
+            db_conn,
+            central,
+            client_id="oauth-cid",
+            update_id="u-fw",
+            run_timestamp="ts",
+            progress=None,
+        )
+    mock_del_ver.assert_called_once()
+    assert mock_del_ver.call_args.kwargs["prune"] is True
+    assert mock_del_ver.call_args.kwargs["keep_versions"] == {"v9"}
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_tenant_incremental(
+    mock_gfw, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+):
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
     central = MagicMock()
     central.whoami = SimpleNamespace(
         id="t1", data_region_url=lambda: "https://h/"
@@ -912,9 +970,51 @@ def test_sync_tenant_firewalls_alerts_and_details_firewalls_api_failed(db_conn):
         )
 
 
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alerts", return_value=[])
+@patch("central.sync_to_db.get_new_alert_ids", return_value=[])
+@patch("central.sync_to_db.get_latest_alert_raised_at", return_value=None)
+@patch(
+    "central.sync_to_db.get_firewalls",
+    return_value=[
+        SimpleNamespace(
+            id="fw1",
+            serialNumber="sn",
+            tenant=SimpleNamespace(id="t1"),
+            group=None,
+            status=None,
+        )
+    ],
+)
+def test_sync_tenant_firewalls_alerts_and_details_firmware_check_fails(
+    mock_fw_up, mock_alerts, mock_new, mock_latest, mock_gfw, db_conn
+):
+    mock_fw_up.return_value = ReturnState(success=False, message="no fw check")
+    central = MagicMock()
+    _sync_tenant_firewalls_alerts_and_details(
+        db_conn,
+        central,
+        tenant_id="t1",
+        url_base="https://h/",
+        tenant_display_name="TD",
+        client_id="c",
+        update_id="u",
+        run_timestamp="ts",
+        elapsed_by_table={},
+        progress=None,
+        progress_label_prefix="",
+        progress_first_step=None,
+    )
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
 def test_sync_tenant_firewalls_alerts_and_details_success_rows_and_details(
+    mock_fw_up,
     db_conn,
 ):
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
     central = MagicMock()
     sp = SyncProgress()
     sp._visible = False
@@ -973,8 +1073,57 @@ def test_sync_tenant_incremental_default_elapsed_and_progress(db_conn):
             elapsed_by_table=None,
             progress=prog,
         )
-    prog.set_total.assert_called_once_with(4)
+    prog.set_total.assert_called_once_with(5)
     prog.update.assert_any_call("Tenant record", 0)
+
+
+@patch("central.sync_to_db._sync_tenant_firewalls_alerts_and_details")
+def test_sync_tenant_incremental_preserves_elapsed_dict(mock_inner, db_conn):
+    central = MagicMock()
+    central.whoami = SimpleNamespace(
+        id="t1", data_region_url=lambda: "https://h/"
+    )
+    elapsed = {"firewalls": 1.0}
+    sync_tenant_incremental(
+        db_conn,
+        central,
+        client_id="oauth-cid",
+        update_id="u",
+        run_timestamp="ts",
+        elapsed_by_table=elapsed,
+        progress=None,
+    )
+    mock_inner.assert_called_once()
+    assert elapsed is mock_inner.call_args.kwargs["elapsed_by_table"]
+
+
+@patch("central.sync_to_db.firmware_upgrade_check")
+@patch("central.sync_to_db.get_alert")
+@patch("central.sync_to_db.get_alerts")
+@patch("central.sync_to_db.get_firewalls")
+def test_sync_tenant_incremental_without_progress_updates(
+    mock_gfw, mock_alerts, mock_get_alert, mock_fw_up, db_conn
+):
+    mock_fw_up.return_value = SimpleNamespace(
+        success=True, firewalls=[], firmwareVersions=[]
+    )
+    central = MagicMock()
+    central.whoami = SimpleNamespace(
+        id="t1", data_region_url=lambda: "https://h/"
+    )
+    mock_gfw.return_value = []
+    mock_alerts.return_value = []
+    with patch("central.sync_to_db.get_new_alert_ids", return_value=[]), patch(
+        "central.sync_to_db.get_latest_alert_raised_at", return_value=None
+    ):
+        sync_tenant_incremental(
+            db_conn,
+            central,
+            client_id="c",
+            update_id="u",
+            run_timestamp="ts",
+            progress=None,
+        )
 
 
 @patch("central.sync_to_db.CentralSession")

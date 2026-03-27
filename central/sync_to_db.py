@@ -17,7 +17,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -95,6 +95,14 @@ class CredentialsSyncResult:
     summary: dict[str, dict[str, int]]
     elapsed_by_table: dict[str, float]
     total_elapsed: float
+
+
+@dataclass
+class _FirmwareVersionsAggregate:
+    """Accumulate firmware_release note keys across partner tenants for one client-side prune."""
+
+    prune: bool = False
+    versions: set[str] = field(default_factory=set)
 
 
 def get_creds() -> dict:
@@ -1580,12 +1588,17 @@ def _sync_tenant_firewalls_alerts_and_details(
     progress: SyncProgress | None = None,
     progress_label_prefix: str = "",
     progress_first_step: int | None = None,
+    firmware_versions_aggregate: _FirmwareVersionsAggregate | None = None,
 ) -> None:
-    """Firewalls, incremental alerts (from latest cached ``raised_at``), and details for new alerts only.
+    """Firewalls, incremental alerts (from latest cached ``raised_at``), details for new alerts, and firmware checks.
 
     Used by full partner/tenant sync and by :func:`sync_partner_incremental` / :func:`sync_tenant_incremental`.
     When ``progress`` is set, ``progress_first_step`` must be the step index for the firewalls sub-step
-    (alerts and details use ``progress_first_step + 1`` and ``+ 2``).
+    (alerts, details, and firmware use ``+ 1``, ``+ 2``, and ``+ 3``).
+
+    When ``firmware_versions_aggregate`` is set (partner multi-tenant), successful firmware responses
+    merge into it and the caller must call :func:`delete_stale_firmware_versions_for_client` after all
+    tenants. When omitted, that prune runs inside this function after a successful check (single tenant).
     """
     lbl = progress_label_prefix
 
@@ -1713,6 +1726,84 @@ def _sync_tenant_firewalls_alerts_and_details(
             len(new_alert_ids),
         )
 
+    if progress is not None:
+        progress.update(f"{lbl}Firmware", progress_first_step + 3)
+    if firewalls:
+        t0 = time.perf_counter()
+        fw_ids = [fw.id for fw in firewalls]
+        firmware_result = firmware_upgrade_check(
+            central,
+            fw_ids,
+            url_base=url_base,
+            tenant_id=tenant_id,
+        )
+        if isinstance(firmware_result, ReturnState) and not firmware_result.success:
+            logger.warning(
+                "Firmware upgrade check for tenant %s (%s): %s",
+                tenant_display_name,
+                tenant_id,
+                firmware_result.message,
+            )
+        else:
+            for upgrade in firmware_result.firewalls:
+                upsert_firmware_upgrade(
+                    conn,
+                    upgrade,
+                    client_id=client_id,
+                    tenant_id=tenant_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+            for fw_ver in firmware_result.firmwareVersions:
+                upsert_firmware_version(
+                    conn,
+                    fw_ver,
+                    client_id=client_id,
+                    update_id=update_id,
+                    run_timestamp=run_timestamp,
+                )
+        fw_api_ok = not (
+            isinstance(firmware_result, ReturnState)
+            and not firmware_result.success
+        )
+        if fw_api_ok:
+            vers = {v.version for v in firmware_result.firmwareVersions}
+            if firmware_versions_aggregate is not None:
+                firmware_versions_aggregate.prune = True
+                firmware_versions_aggregate.versions.update(vers)
+            else:
+                delete_stale_firmware_versions_for_client(
+                    conn,
+                    client_id=client_id,
+                    keep_versions=vers,
+                    prune=True,
+                )
+        delete_stale_firmware_upgrades_for_tenant(
+            conn,
+            client_id=client_id,
+            tenant_id=tenant_id,
+            keep_firewall_ids={fw.id for fw in firewalls},
+            api_ok=fw_api_ok,
+        )
+        elapsed = time.perf_counter() - t0
+        elapsed_by_table["firmware_upgrades"] = (
+            elapsed_by_table.get("firmware_upgrades", 0) + elapsed
+        )
+        elapsed_by_table["firmware_versions"] = (
+            elapsed_by_table.get("firmware_versions", 0) + elapsed
+        )
+        logger.info(
+            "Tenant %s: %d firmware upgrade rows, %d firmware versions synced (%s)",
+            tenant_display_name,
+            len(firmware_result.firewalls)
+            if not isinstance(firmware_result, ReturnState)
+            else 0,
+            len(firmware_result.firmwareVersions)
+            if not isinstance(firmware_result, ReturnState)
+            else 0,
+            _format_duration(elapsed),
+        )
+
 
 def sync_partner_incremental(
     conn,
@@ -1724,7 +1815,7 @@ def sync_partner_incremental(
     elapsed_by_table: dict[str, float] | None = None,
     progress: SyncProgress | None = None,
 ) -> None:
-    """Partner sync: tenants list plus firewalls, incremental alerts, and alert details only."""
+    """Partner sync: tenants list plus firewalls, incremental alerts, alert details, and firmware checks."""
     if elapsed_by_table is None:
         elapsed_by_table = {}
     with sync_change_logging(update_id, client_id, run_timestamp):
@@ -1759,8 +1850,9 @@ def _sync_partner_incremental_body(
     else:
         tenants = list(tenants_result)
     tenant_ids_seen = {t.id for t in tenants}
+    firmware_versions_aggregate = _FirmwareVersionsAggregate()
 
-    steps_per_tenant = 3
+    steps_per_tenant = 4
     total_steps = len(tenants) * steps_per_tenant
     if progress is not None:
         progress.set_total(total_steps)
@@ -1795,9 +1887,16 @@ def _sync_partner_incremental_body(
             progress=progress,
             progress_label_prefix=prefix,
             progress_first_step=step,
+            firmware_versions_aggregate=firmware_versions_aggregate,
         )
         step += steps_per_tenant
 
+    delete_stale_firmware_versions_for_client(
+        conn,
+        client_id=client_id,
+        keep_versions=firmware_versions_aggregate.versions,
+        prune=firmware_versions_aggregate.prune,
+    )
     delete_stale_tenants_for_partner(
         conn,
         client_id=client_id,
@@ -1816,7 +1915,7 @@ def sync_tenant_incremental(
     elapsed_by_table: dict[str, float] | None = None,
     progress: SyncProgress | None = None,
 ) -> None:
-    """Tenant credential sync: firewalls, incremental alerts, and alert details only."""
+    """Tenant credential sync: firewalls, incremental alerts, alert details, and firmware checks."""
     if elapsed_by_table is None:
         elapsed_by_table = {}
     with sync_change_logging(update_id, client_id, run_timestamp):
@@ -1844,7 +1943,7 @@ def _sync_tenant_incremental_body(
     whoami = central.whoami
     url_base = whoami.data_region_url()
     if progress is not None:
-        progress.set_total(4)
+        progress.set_total(5)
         progress.update("Tenant record", 0)
     t0 = time.perf_counter()
     ensure_tenant_record(
@@ -1981,9 +2080,9 @@ def sync_client_credentials_to_database_incremental(
     progress: SyncProgress | None = None,
 ) -> CredentialsSyncResult:
     """
-    Incremental sync: firewalls, alerts (from last cached ``raised_at`` per tenant), and alert
-    details for alerts new in this run only. Does not touch licenses, roles/admins, firmware,
-    firewall groups, or MDR.
+    Incremental sync: firewalls, alerts (from last cached ``raised_at`` per tenant), alert
+    details for alerts new in this run only, and firmware upgrade checks. Does not touch licenses,
+    roles/admins, firewall groups, or MDR.
 
     Same credentials and result shape as :func:`sync_client_credentials_to_database`.
     """
@@ -2108,8 +2207,8 @@ def parse_args():
         "--incremental",
         action="store_true",
         help=(
-            "Only sync firewalls, alerts (from last cached raised_at per tenant), and alert "
-            "details for new alerts. Skips licenses, roles, admins, firmware, groups, and MDR."
+            "Only sync firewalls, alerts (from last cached raised_at per tenant), alert "
+            "details for new alerts, and firmware checks. Skips licenses, roles, admins, groups, and MDR."
         ),
     )
     return p.parse_args()
