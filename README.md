@@ -150,6 +150,58 @@ if not isinstance(result, ReturnState):
         print(ver.version, ver.releaseDate)
 ```
 
+**Firewall configuration import/export**
+
+```python
+from central.firewalls.config.methods import (
+    complete_firewall_config_import_upload,
+    export_firewall_config,
+    get_cross_firewall_transaction,
+    start_firewall_config_import,
+)
+
+# Export runs asynchronously and returns a transaction ID.
+export_result = export_firewall_config(
+    central,
+    firewall_id="firewall-id",
+    full_export=False,
+    include_dependency=True,
+    export_entities=["FirewallRule", "NATRule"],
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+)
+transaction_id = export_result.value.data.transactionId
+
+# Import starts by requesting a pre-signed upload URL.
+upload_result = start_firewall_config_import(
+    central,
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+)
+upload = upload_result.value.data
+print(upload.method, upload.url, upload.expiresAt)
+
+# After uploading the archive to upload.url, complete the import.
+complete_result = complete_firewall_config_import_upload(
+    central,
+    transaction_id=upload.transactionId,
+    firewall_ids=["firewall-id"],
+    checksum_md5="d41d8cd98f00b204e9800998ecf8427e",
+    file_size_bytes=1024,
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+)
+
+# Poll cross-firewall transactions.
+transaction = get_cross_firewall_transaction(
+    central,
+    transaction_id=upload.transactionId,
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+)
+print(transaction.value.data.status, transaction.value.data.result)
+```
+
 **Partner: list tenants**
 
 ```python
