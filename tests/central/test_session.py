@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from central.classes import CentralResponse, ReturnState
+from central.classes import ReturnState
 from central.session import CentralSession
 
 

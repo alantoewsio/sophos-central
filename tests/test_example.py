@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -172,17 +172,6 @@ def test_main_tenant_branch(
     )
     mock_gfw.return_value = [fw]
     mock_grp.return_value = []
-    sub = SimpleNamespace(
-        type="t",
-        licenseIdentifier="l",
-        product=None,
-        startDate="s",
-        endDate=None,
-        perpetual=True,
-        quantity=1,
-        unlimited=False,
-        usage=None,
-    )
     lic = License(
         serialNumber="x",
         owner={"id": "o", "type": "partner"},

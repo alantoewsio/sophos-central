@@ -60,8 +60,6 @@ def test_add_headers_no_jwt(mock_get, mock_post):
 @patch("central.session.requests.get")
 def test_get_pagination_next_key_exhausted(mock_get, mock_post):
     """Cover branch where nextKey becomes None after a page."""
-    from types import SimpleNamespace
-
     mock_post.return_value = MagicMock(status_code=200, json=lambda: {"access_token": "t", "expires_in": 3600})
     mock_get.side_effect = [
         MagicMock(status_code=200, json=lambda: {

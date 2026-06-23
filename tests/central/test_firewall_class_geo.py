@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from central.firewalls.firmware.classes import FirmwareUpgrade
 from central.firewalls.classes import Firewall
 

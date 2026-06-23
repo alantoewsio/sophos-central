@@ -20,7 +20,6 @@ def test_get_alerts_success():
 
 def test_get_alerts_failure():
     central = MagicMock()
-    r = MagicMock(status_code=400, json=lambda: {}, error_message="e")
     cr = CentralResponse(MagicMock(status_code=400, json=lambda: {"error": "e"}))
     cr.error_message = "e"
     central.get.return_value = ReturnState(success=False, value=cr)

@@ -3,7 +3,6 @@
 from datetime import datetime
 
 from central.firewalls.firmware.classes import (
-    FirewallUpgrade,
     FirewallUpgradeInfo,
     FirmwareUpgrade,
     FirmwareVersion,
