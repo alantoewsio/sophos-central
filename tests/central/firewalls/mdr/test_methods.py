@@ -125,3 +125,23 @@ def test_get_firewall_transaction_omits_fields_param():
     central.get_page.return_value = _rs(_cr(200, {"id": "tx"}))
     get_firewall_transaction(central, "fw", "tx1", fields=None)
     assert central.get_page.call_args[1]["params"] is None
+
+
+def test_mdr_create_indicators_payload_matches_docs():
+    central = MagicMock()
+    central.post.return_value = _rs(_cr(202, {"transactionId": "tx"}))
+    create_mdr_threat_feed_indicators(
+        central,
+        "fw-1",
+        [{"value": "example.com", "type": "domain-name"}],
+    )
+    assert central.post.call_args[1]["payload"] == {
+        "indicators": [{"value": "example.com", "type": "domain-name"}]
+    }
+
+
+def test_mdr_search_payload_matches_docs():
+    central = MagicMock()
+    central.post.return_value = _rs(_cr(202, {"transactionId": "tx"}))
+    search_mdr_threat_feed_indicators(central, "fw-1", ["example.com"])
+    assert central.post.call_args[1]["payload"] == {"indicatorValues": ["example.com"]}
