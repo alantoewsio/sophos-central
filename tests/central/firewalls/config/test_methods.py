@@ -207,6 +207,22 @@ def test_wait_for_firewall_config_transaction_returns_poll_failure():
     assert out.message == "Error: not authenticated"
 
 
+@patch("central.firewalls.config.methods.time.sleep")
+def test_wait_for_firewall_config_transaction_default_interval_is_15_seconds(
+    mock_sleep,
+):
+    central = MagicMock()
+    central.get_page.side_effect = [
+        _rs(200, {"id": "tx-1", "status": "pending", "result": "notAvailable"}),
+        _rs(200, {"id": "tx-1", "status": "finished", "result": "success"}),
+    ]
+
+    out = wait_for_firewall_config_transaction(central, "tx-1")
+
+    assert out.success
+    mock_sleep.assert_called_once_with(15)
+
+
 @patch("central.firewalls.config.methods.time.monotonic", side_effect=[0, 6])
 def test_wait_for_firewall_config_transaction_times_out(mock_monotonic):
     central = MagicMock()

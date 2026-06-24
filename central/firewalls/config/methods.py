@@ -140,7 +140,7 @@ def get_firewall_config_transaction(
 def wait_for_firewall_config_transaction(
     central: CentralSession,
     transaction_id: str,
-    interval_seconds: float = 5,
+    interval_seconds: float = 15,
     timeout_seconds: float = 600,
     on_update: Optional[Callable[[Transaction], None]] = None,
     on_complete: Optional[Callable[[Transaction], None]] = None,
