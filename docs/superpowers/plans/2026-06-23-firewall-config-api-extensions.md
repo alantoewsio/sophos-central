@@ -4,7 +4,7 @@
 
 **Goal:** Extend the SDK to wrap the upcoming Sophos Central Firewall Config APIs from `C:\Users\AlanToews\Downloads\firewall-config-docs\firewall-config-docs.html`.
 
-**Architecture:** Keep the existing `central.firewalls.mdr` module because it already covers the MDR threat-feed endpoints in the attached OpenAPI document. Add a new `central.firewalls.config` package for firewall configuration export/import and cross-firewall transactions, using the same `ReturnState`, `CentralResponse`, status-message mapping, and mocked HTTP-test patterns used elsewhere in the SDK.
+**Architecture:** Keep the existing `central.firewalls.mdr` module because it already covers the MDR threat-feed endpoints in the attached OpenAPI document. Add a new `central.firewalls.config` package for firewall configuration export/import and firewall config transactions, using the same `ReturnState`, `CentralResponse`, status-message mapping, and mocked HTTP-test patterns used elsewhere in the SDK.
 
 **Tech Stack:** Python 3.12, dataclasses, `requests` through `CentralSession`, `pytest`, `unittest.mock`.
 
@@ -45,7 +45,7 @@ Missing APIs to add:
   - `export_firewall_config`
   - `start_firewall_config_import`
   - `complete_firewall_config_import_upload`
-  - `get_cross_firewall_transaction`
+  - `get_firewall_config_transaction`
 - Create `tests/central/firewalls/config/__init__.py`.
 - Create `tests/central/firewalls/config/test_classes.py`.
 - Create `tests/central/firewalls/config/test_methods.py`.
@@ -294,7 +294,7 @@ from central.firewalls.config.classes import PresignedUpload, Transaction, Trans
 from central.firewalls.config.methods import (
     complete_firewall_config_import_upload,
     export_firewall_config,
-    get_cross_firewall_transaction,
+    get_firewall_config_transaction,
     start_firewall_config_import,
 )
 
@@ -378,13 +378,13 @@ def test_complete_firewall_config_import_upload_returns_transaction():
     assert central.post.call_args[1]["payload"]["performPartialImport"] is True
 
 
-def test_get_cross_firewall_transaction_uses_get_page_without_pagination():
+def test_get_firewall_config_transaction_uses_get_page_without_pagination():
     central = MagicMock()
     central.get_page.return_value = _rs(
         200,
         {"id": "tx-1", "status": "finished", "result": "success"},
     )
-    out = get_cross_firewall_transaction(central, "tx-1", tenant_id="tenant-1")
+    out = get_firewall_config_transaction(central, "tx-1", tenant_id="tenant-1")
     assert out.success
     assert isinstance(out.value.data, Transaction)
     central.get_page.assert_called_once_with(
@@ -535,7 +535,7 @@ def complete_firewall_config_import_upload(
     return _wrap_response(rs, _TRANSACTION, Transaction)
 
 
-def get_cross_firewall_transaction(
+def get_firewall_config_transaction(
     central: CentralSession,
     transaction_id: str,
     url_base: str = None,
@@ -631,7 +631,7 @@ Add this section after the existing firewall API examples:
 from central.firewalls.config.methods import (
     complete_firewall_config_import_upload,
     export_firewall_config,
-    get_cross_firewall_transaction,
+    get_firewall_config_transaction,
     start_firewall_config_import,
 )
 
@@ -667,8 +667,8 @@ complete_result = complete_firewall_config_import_upload(
     url_base=central.whoami.data_region_url(),
 )
 
-# Poll cross-firewall transactions.
-transaction = get_cross_firewall_transaction(
+# Poll firewall config transactions.
+transaction = get_firewall_config_transaction(
     central,
     transaction_id=upload.transactionId,
     tenant_id=central.whoami.id,
@@ -722,6 +722,6 @@ Expected: branch `codex/central-api-extensions-plan` or the implementation branc
 
 ## Self-Review
 
-- Spec coverage: The plan covers all four missing import/export/cross-firewall transaction endpoints and verifies the seven MDR endpoints already present in `central.firewalls.mdr`.
+- Spec coverage: The plan covers all four missing import/export/firewall config transaction endpoints and verifies the seven MDR endpoints already present in `central.firewalls.mdr`.
 - Placeholder scan: No implementation step depends on unspecified code.
 - Type consistency: Method names, class names, payload field names, and response parser names are consistent across tasks.

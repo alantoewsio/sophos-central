@@ -156,8 +156,9 @@ if not isinstance(result, ReturnState):
 from central.firewalls.config.methods import (
     complete_firewall_config_import_upload,
     export_firewall_config,
-    get_cross_firewall_transaction,
+    get_firewall_config_transaction,
     start_firewall_config_import,
+    wait_for_firewall_config_transaction,
 )
 
 # Export runs asynchronously and returns a transaction ID.
@@ -171,6 +172,16 @@ export_result = export_firewall_config(
     url_base=central.whoami.data_region_url(),
 )
 transaction_id = export_result.value.data.transactionId
+
+# Wait for export completion and read the pre-signed download URL from the transaction response.
+export_transaction = wait_for_firewall_config_transaction(
+    central,
+    transaction_id=transaction_id,
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+    on_update=lambda tx: print(tx.status, tx.result),
+)
+download_url = export_transaction.value.data.response["url"]
 
 # Import starts by requesting a pre-signed upload URL.
 upload_result = start_firewall_config_import(
@@ -192,8 +203,8 @@ complete_result = complete_firewall_config_import_upload(
     url_base=central.whoami.data_region_url(),
 )
 
-# Poll cross-firewall transactions.
-transaction = get_cross_firewall_transaction(
+# Poll a firewall config transaction without waiting.
+transaction = get_firewall_config_transaction(
     central,
     transaction_id=upload.transactionId,
     tenant_id=central.whoami.id,

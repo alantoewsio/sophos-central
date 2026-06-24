@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from typing import Optional
 
 from central.classes import ReturnState
@@ -118,7 +120,7 @@ def complete_firewall_config_import_upload(
     return _wrap_response(rs, _TRANSACTION, Transaction)
 
 
-def get_cross_firewall_transaction(
+def get_firewall_config_transaction(
     central: CentralSession,
     transaction_id: str,
     url_base: str = None,
@@ -133,3 +135,51 @@ def get_cross_firewall_transaction(
         partner_id=partner_id,
     )
     return _wrap_response(rs, _TRANSACTION, Transaction)
+
+
+def wait_for_firewall_config_transaction(
+    central: CentralSession,
+    transaction_id: str,
+    interval_seconds: float = 5,
+    timeout_seconds: float = 600,
+    on_update: Optional[Callable[[Transaction], None]] = None,
+    on_complete: Optional[Callable[[Transaction], None]] = None,
+    url_base: str = None,
+    tenant_id: str = None,
+    partner_id: str = None,
+) -> ReturnState:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        result = get_firewall_config_transaction(
+            central,
+            transaction_id,
+            url_base=url_base,
+            tenant_id=tenant_id,
+            partner_id=partner_id,
+        )
+        if not result.success:
+            return result
+
+        transaction = result.value.data
+        if on_update is not None:
+            on_update(transaction)
+
+        if transaction.status == "finished":
+            if on_complete is not None:
+                on_complete(transaction)
+            success = transaction.result in {"success", "partialSuccess"}
+            message = (
+                "Transaction completed successfully"
+                if success
+                else f"Transaction finished with result {transaction.result}"
+            )
+            return ReturnState(success=success, message=message, value=result.value)
+
+        if time.monotonic() >= deadline:
+            return ReturnState(
+                success=False,
+                message=f"Transaction {transaction_id} timed out after {timeout_seconds:g} seconds",
+                value=result.value,
+            )
+
+        time.sleep(interval_seconds)
