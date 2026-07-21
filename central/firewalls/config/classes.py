@@ -41,7 +41,7 @@ class TransactionRequest:
     def __init__(self, data: dict[str, Any]):
         self.method = data.get("method")
         self.path = data.get("path")
-        self.query = [TransactionQuery(**item) for item in data.get("query", [])]
+        self.query = [TransactionQuery(**item) for item in data.get("query") or []]
 
 
 @dataclass

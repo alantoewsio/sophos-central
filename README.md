@@ -152,6 +152,8 @@ if not isinstance(result, ReturnState):
 
 **Firewall configuration import/export**
 
+The firewall configuration APIs wrap the upcoming Central firewall-config endpoints. Export and import operations are asynchronous: the initial call returns a transaction ID, then you poll the transaction endpoint until it finishes. Finished export transactions include a pre-signed download URL in `transaction.response["url"]`.
+
 ```python
 from central.firewalls.config.methods import (
     complete_firewall_config_import_upload,
@@ -161,7 +163,18 @@ from central.firewalls.config.methods import (
     wait_for_firewall_config_transaction,
 )
 
-# Export runs asynchronously and returns a transaction ID.
+# Export all configuration for one firewall. For full exports, omit
+# include_dependency and export_entities.
+full_export_result = export_firewall_config(
+    central,
+    firewall_id="firewall-id",
+    full_export=True,
+    tenant_id=central.whoami.id,
+    url_base=central.whoami.data_region_url(),
+)
+full_export_transaction_id = full_export_result.value.data.transactionId
+
+# Partial exports can include dependent objects and selected entity types.
 export_result = export_firewall_config(
     central,
     firewall_id="firewall-id",
@@ -173,15 +186,20 @@ export_result = export_firewall_config(
 )
 transaction_id = export_result.value.data.transactionId
 
-# Wait for export completion and read the pre-signed download URL from the transaction response.
+# Wait for export completion. The default polling interval is 15 seconds.
+# Optional callbacks receive each Transaction object.
 export_transaction = wait_for_firewall_config_transaction(
     central,
     transaction_id=transaction_id,
     tenant_id=central.whoami.id,
     url_base=central.whoami.data_region_url(),
     on_update=lambda tx: print(tx.status, tx.result),
+    on_complete=lambda tx: print("finished", tx.result),
 )
 download_url = export_transaction.value.data.response["url"]
+download_method = export_transaction.value.data.response.get("method", "GET")
+download_expires_at = export_transaction.value.data.response.get("expiresAt")
+print(download_method, download_url, download_expires_at)
 
 # Import starts by requesting a pre-signed upload URL.
 upload_result = start_firewall_config_import(
@@ -192,7 +210,8 @@ upload_result = start_firewall_config_import(
 upload = upload_result.value.data
 print(upload.method, upload.url, upload.expiresAt)
 
-# After uploading the archive to upload.url, complete the import.
+# Upload the archive bytes to upload.url using upload.method outside the SDK,
+# then notify Central that the upload has completed.
 complete_result = complete_firewall_config_import_upload(
     central,
     transaction_id=upload.transactionId,
@@ -203,7 +222,7 @@ complete_result = complete_firewall_config_import_upload(
     url_base=central.whoami.data_region_url(),
 )
 
-# Poll a firewall config transaction without waiting.
+# Poll a firewall config transaction once without waiting.
 transaction = get_firewall_config_transaction(
     central,
     transaction_id=upload.transactionId,
@@ -212,6 +231,14 @@ transaction = get_firewall_config_transaction(
 )
 print(transaction.value.data.status, transaction.value.data.result)
 ```
+
+The SDK data classes used by these methods are:
+
+- `TransactionReference`: returned by `export_firewall_config`; contains `transactionId`.
+- `PresignedUpload`: returned by `start_firewall_config_import`; contains `transactionId`, `url`, `method`, and `expiresAt`.
+- `Transaction`: returned by `get_firewall_config_transaction`, `wait_for_firewall_config_transaction`, and import completion; contains `id`, `status`, `result`, `createdAt`, `finishedAt`, `expiryAt`, `response`, and `request`.
+- `ExportConfigRequest`: maps Python arguments to Central fields `fullExport`, `includeDependency`, and `exportEntities`.
+- `ImportUploadCompleteRequest`: maps Python arguments to Central fields `firewallIds`, `checksumMd5`, `fileSizeBytes`, `secureMasterKey`, and `performPartialImport`.
 
 **Partner: list tenants**
 

@@ -46,6 +46,22 @@ def test_transaction_parses_optional_request_query():
     assert tx.request.query[0].key == "fields"
 
 
+def test_transaction_allows_null_request_query():
+    tx = Transaction(
+        {
+            "id": "tx-1",
+            "status": "finished",
+            "result": "success",
+            "request": {
+                "method": "POST",
+                "path": "/firewalls/fw-1/export",
+                "query": None,
+            },
+        }
+    )
+    assert tx.request.query == []
+
+
 def test_export_config_request_full_export_payload():
     request = ExportConfigRequest(full_export=True)
     assert request.to_payload() == {"fullExport": True}
