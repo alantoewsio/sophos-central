@@ -53,6 +53,12 @@ def test_authenticate_http_error(mock_post):
     s = CentralSession("id", "sec")
     r = s._do_authenticate()
     assert r.success is False
+    assert mock_post.call_args.kwargs["data"] == {
+        "grant_type": "client_credentials",
+        "client_id": "id",
+        "client_secret": "sec",
+        "scope": "token",
+    }
 
 
 @patch("central.session.requests.post")

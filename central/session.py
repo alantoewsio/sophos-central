@@ -39,7 +39,12 @@ class CentralSession:
 
         logger.debug("Posting token request to %s", _auth_url)
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        payload = f"grant_type=client_credentials&client_id={self.client_id}&client_secret={self.client_secret}&scope=token"
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": "token",
+        }
         response = requests.post(
             _auth_url, headers=headers, data=payload, timeout=_REQUEST_TIMEOUT
         )

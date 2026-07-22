@@ -25,16 +25,19 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "dotenv>=0.9.9",
+    "idna>=3.15",
     "openpyxl>=3.1.0",
-    "requests>=2.32.5",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.0",
+    "urllib3>=2.7.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "ruff>=0.15.0",
-    "pytest>=8.0.0",
+    "pytest>=9.0.3",
     "pytest-cov>=5.0.0",
+    "pygments>=2.20.0",
     "bandit[toml]>=1.7.0",
     "pip-audit>=2.0.0",
 ]
