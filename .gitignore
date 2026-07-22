@@ -16,3 +16,12 @@ logs/
 *.log
 *.env
 *xlsx
+
+# Local Sophos Central API artifacts
+config.json
+events_config.json
+siem_events*_config.json
+firewall-config-*.tar
+alerts/
+events/
+test_firewall_config_export.py
