@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sfos-central-sdk"
-version = "0.9.10"
+version = "0.9.11"
 description = "CLI and Python API for Sophos Central (firewalls, licenses, alerts, firmware)"
 readme = "README.md"
 license = "Apache-2.0"
@@ -41,6 +41,11 @@ dev = [
 
 [project.scripts]
 central-sync-to-db = "central.sync_to_db:main"
+
+[project.urls]
+Homepage = "https://github.com/alantoewsio/sophos-central"
+Repository = "https://github.com/alantoewsio/sophos-central"
+Issues = "https://github.com/alantoewsio/sophos-central/issues"
 
 [tool.setuptools]
 py-modules = ["example"]
